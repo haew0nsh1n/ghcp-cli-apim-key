@@ -70,7 +70,8 @@ Gateway는 API의 `subscriptionRequired: true` 설정에 따라 APIM 기본 구�
 
 Azure 리소스 관리 로그인은 모델 API 호출 인증과 별개입니다.
 현재 CLI 실행 스크립트는 시작 시 Azure 관리 API에서 리소스 정보와 APIM 구독 키를 조회하므로,
-`az login` 세션과 해당 관리 권한이 필요합니다. 모델 API 호출에는 Entra 사용자 JWT를 사용하지 않습니다.
+`az login` 세션과 해당 관리 권한이 필요합니다.
+모델 호출은 키 기반으로 인증하며, CLI → Gateway는 APIM 구독 키, Gateway → Azure OpenAI는 Azure OpenAI API 키를 사용합니다.
 
 ## 필수 조건
 
