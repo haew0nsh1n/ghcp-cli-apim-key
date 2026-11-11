@@ -1,0 +1,7 @@
+name: entra-apim-openai-user-tracking
+metadata:
+  template: entra-apim-openai-user-tracking@0.0.1
+infra:
+  provider: bicep
+  path: ./infra
+  module: main

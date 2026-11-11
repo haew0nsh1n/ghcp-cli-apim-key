@@ -1,0 +1,48 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "value": "${AZURE_LOCATION}"
+    },
+    "resourcePrefix": {
+      "value": "${RESOURCE_PREFIX}"
+    },
+    "apimSubscriptionId": {
+      "value": "${APIM_SUBSCRIPTION_ID=copilot-cli}"
+    },
+    "apimPublisherEmail": {
+      "value": "${APIM_PUBLISHER_EMAIL}"
+    },
+    "apimPublisherName": {
+      "value": "${APIM_PUBLISHER_NAME}"
+    },
+    "apimSkuName": {
+      "value": "${APIM_SKU_NAME=Developer}"
+    },
+    "openAiModelName": {
+      "value": "${OPENAI_MODEL_NAME=gpt-5-mini}"
+    },
+    "openAiModelVersion": {
+      "value": "${OPENAI_MODEL_VERSION=2025-08-07}"
+    },
+    "openAiDeploymentName": {
+      "value": "${OPENAI_DEPLOYMENT_NAME=gpt-5-mini}"
+    },
+    "openAiDeploymentSkuName": {
+      "value": "${OPENAI_DEPLOYMENT_SKU_NAME=GlobalStandard}"
+    },
+    "openAiDeploymentCapacity": {
+      "value": "${OPENAI_DEPLOYMENT_CAPACITY=200}"
+    },
+    "tokensPerMinute": {
+      "value": "${TOKENS_PER_MINUTE=200000}"
+    },
+    "tokenQuota": {
+      "value": "${TOKEN_QUOTA=1000000}"
+    },
+    "tokenQuotaPeriod": {
+      "value": "${TOKEN_QUOTA_PERIOD=Monthly}"
+    }
+  }
+}

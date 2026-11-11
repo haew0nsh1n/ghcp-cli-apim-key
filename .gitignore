@@ -1,0 +1,42 @@
+# Environment variables
+.env
+.azure/
+.self-hosted-gateway.*/
+.api-key-check.*/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor / IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Node.js
+node_modules/
+package-lock.json
+
+# Shell script artifacts
+*.pid
+*.out

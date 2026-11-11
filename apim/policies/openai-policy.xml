@@ -1,0 +1,138 @@
+<policies>
+  <inbound>
+    <base />
+
+    <choose>
+      <when condition="@(context.Deployment.Gateway.IsManaged)">
+        <return-response>
+          <set-status code="403" reason="Forbidden" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>{"error":{"message":"Use the self-hosted gateway endpoint."}}</set-body>
+        </return-response>
+      </when>
+    </choose>
+    <!-- APIM validates the subscription key before evaluating API policies. -->
+    <set-variable name="subscription-id" value="@(context.Subscription.Id)" />
+
+    <!-- Neither the subscription key nor the CLI's duplicate bearer header reaches the model. -->
+    <set-header name="Ocp-Apim-Subscription-Key" exists-action="delete" />
+    <set-header name="Authorization" exists-action="delete" />
+    <set-query-parameter name="subscription-key" exists-action="delete" />
+
+    <set-variable name="deployment-name" value="{{OPENAI_DEPLOYMENT_NAME}}" />
+
+    <!-- Azure OpenAI v1 selects the deployment through the model request field. -->
+    <set-body>@{
+      var body = context.Request.Body.As&lt;JObject&gt;(preserveContent: true);
+      body[&quot;model&quot;] = (string)context.Variables[&quot;deployment-name&quot;];
+      if (body[&quot;max_tokens&quot;] != null)
+      {
+        if (body[&quot;max_completion_tokens&quot;] == null)
+        {
+          body[&quot;max_completion_tokens&quot;] = body[&quot;max_tokens&quot;];
+        }
+        body.Remove(&quot;max_tokens&quot;);
+      }
+      return body.ToString();
+    }</set-body>
+
+    <!-- Native per-subscription enforcement. Actual usage updates the counter. -->
+    <llm-token-limit
+      counter-key='@((string)context.Variables["subscription-id"])'
+      tokens-per-minute="{{TOKENS_PER_MINUTE}}"
+      token-quota="{{TOKEN_QUOTA}}"
+      token-quota-period="{{TOKEN_QUOTA_PERIOD}}"
+      estimate-prompt-tokens="false"
+      remaining-tokens-header-name="x-ratelimit-remaining-tokens"
+      remaining-quota-tokens-header-name="x-quota-remaining-tokens"
+      tokens-consumed-header-name="x-tokens-consumed"
+      tokens-consumed-variable-name="tokens-consumed" />
+
+    <!-- Native token metrics. See the documented cardinality limits before production use. -->
+    <llm-emit-token-metric namespace="EntraApimOpenAI">
+      <dimension name="APIM Subscription ID" value='@((string)context.Variables["subscription-id"])' />
+      <dimension name="API" value="openai" />
+      <dimension name="Model" value='@((string)context.Variables["deployment-name"])' />
+    </llm-emit-token-metric>
+
+    <trace source="entra-apim-openai" severity="information">
+      <message>RequestStarted</message>
+      <metadata name="EventName" value="RequestStarted" />
+      <metadata name="SubscriptionId" value='@((string)context.Variables["subscription-id"])' />
+      <metadata name="RequestId" value="@(context.RequestId.ToString())" />
+      <metadata name="Api" value="openai" />
+      <metadata name="Model" value='@((string)context.Variables["deployment-name"])' />
+    </trace>
+
+    <set-header name="api-key" exists-action="override">
+      <value>{{openai-backend-key}}</value>
+    </set-header>
+  </inbound>
+  <backend>
+    <forward-request />
+  </backend>
+  <outbound>
+    <!-- Exact breakdown is available for non-streaming JSON responses with a usage object. -->
+    <set-variable name="is-json-response" value='@(context.Response.Headers.GetValueOrDefault("Content-Type", string.Empty).IndexOf("application/json", StringComparison.OrdinalIgnoreCase) >= 0)' />
+    <choose>
+      <when condition='@((bool)context.Variables["is-json-response"])'>
+        <set-variable name="response-json" value="@(context.Response.Body.As&lt;JObject&gt;(preserveContent: true))" />
+        <set-variable name="prompt-tokens" value="@{
+          var body = (JObject)context.Variables[&quot;response-json&quot;];
+          var usage = body[&quot;usage&quot;] as JObject;
+          return usage == null || usage[&quot;prompt_tokens&quot;] == null ? &quot;0&quot; : usage[&quot;prompt_tokens&quot;].ToString();
+        }" />
+        <set-variable name="completion-tokens" value="@{
+          var body = (JObject)context.Variables[&quot;response-json&quot;];
+          var usage = body[&quot;usage&quot;] as JObject;
+          return usage == null || usage[&quot;completion_tokens&quot;] == null ? &quot;0&quot; : usage[&quot;completion_tokens&quot;].ToString();
+        }" />
+        <set-variable name="total-tokens" value="@{
+          var body = (JObject)context.Variables[&quot;response-json&quot;];
+          var usage = body[&quot;usage&quot;] as JObject;
+          return usage == null || usage[&quot;total_tokens&quot;] == null ? &quot;0&quot; : usage[&quot;total_tokens&quot;].ToString();
+        }" />
+        <set-variable name="usage-is-exact" value="@{
+          var body = (JObject)context.Variables[&quot;response-json&quot;];
+          return body[&quot;usage&quot;] == null ? &quot;false&quot; : &quot;true&quot;;
+        }" />
+      </when>
+      <otherwise>
+        <set-variable name="prompt-tokens" value="0" />
+        <set-variable name="completion-tokens" value="0" />
+        <set-variable name="total-tokens" value='@(context.Variables.ContainsKey("tokens-consumed") ? Convert.ToString(context.Variables["tokens-consumed"]) : "0")' />
+        <set-variable name="usage-is-exact" value="false" />
+      </otherwise>
+    </choose>
+
+    <trace source="entra-apim-openai" severity="information">
+      <message>LlmUsage</message>
+      <metadata name="EventName" value="LlmUsage" />
+      <metadata name="SubscriptionId" value='@((string)context.Variables["subscription-id"])' />
+      <metadata name="RequestId" value="@(context.RequestId.ToString())" />
+      <metadata name="Api" value="openai" />
+      <metadata name="Model" value='@((string)context.Variables["deployment-name"])' />
+      <metadata name="StatusCode" value="@(context.Response.StatusCode.ToString())" />
+      <metadata name="PromptTokens" value='@((string)context.Variables["prompt-tokens"])' />
+      <metadata name="CompletionTokens" value='@((string)context.Variables["completion-tokens"])' />
+      <metadata name="TotalTokens" value='@((string)context.Variables["total-tokens"])' />
+      <metadata name="IsExact" value='@((string)context.Variables["usage-is-exact"])' />
+    </trace>
+    <base />
+  </outbound>
+  <on-error>
+    <trace source="entra-apim-openai" severity="error">
+      <message>ApiError</message>
+      <metadata name="EventName" value="ApiError" />
+      <metadata name="SubscriptionId" value='@(context.Variables.GetValueOrDefault&lt;string&gt;("subscription-id", "unknown"))' />
+      <metadata name="RequestId" value="@(context.RequestId.ToString())" />
+      <metadata name="Api" value="openai" />
+      <metadata name="Model" value='@(context.Variables.GetValueOrDefault&lt;string&gt;("deployment-name", "unknown"))' />
+      <metadata name="ErrorReason" value="@(context.LastError.Reason)" />
+      <metadata name="ErrorSource" value="@(context.LastError.Source)" />
+    </trace>
+    <base />
+  </on-error>
+</policies>
