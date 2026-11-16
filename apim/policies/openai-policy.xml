@@ -19,9 +19,146 @@
     <!-- Neither the subscription key nor the CLI's duplicate bearer header reaches the model. -->
     <set-header name="Ocp-Apim-Subscription-Key" exists-action="delete" />
     <set-header name="Authorization" exists-action="delete" />
+    <set-header name="X-PII-Filter-Key" exists-action="delete" />
     <set-query-parameter name="subscription-key" exists-action="delete" />
 
     <set-variable name="deployment-name" value="{{OPENAI_DEPLOYMENT_NAME}}" />
+
+    <set-variable name="pii-in-progress" value="@(true)" />
+    <set-variable name="pii-input-status" value='@{
+      var mediaType = context.Request.Headers.GetValueOrDefault("Content-Type", "")
+        .Split(";".ToCharArray())[0].Trim();
+      var encoding = context.Request.Headers.GetValueOrDefault("Content-Encoding", "identity");
+      if (!mediaType.Equals("application/json", StringComparison.OrdinalIgnoreCase) ||
+          !encoding.Equals("identity", StringComparison.OrdinalIgnoreCase))
+      {
+        return 415;
+      }
+      if (context.Request.Body == null) { return 400; }
+      var lengthHeader = context.Request.Headers.GetValueOrDefault("Content-Length", "");
+      long length;
+      if (lengthHeader != "" &amp;&amp; (!Int64.TryParse(lengthHeader, out length) || length &lt; 0))
+      {
+        return 400;
+      }
+      if (lengthHeader != "" &amp;&amp; Int64.Parse(lengthHeader) &gt; 1048576) { return 413; }
+      return 0;
+    }' />
+    <choose>
+      <when condition='@((int)context.Variables["pii-input-status"] == 0)'>
+        <set-variable name="pii-request-body" value="@(context.Request.Body.As&lt;string&gt;(preserveContent: true))" />
+        <set-variable name="pii-input-status" value='@(System.Text.Encoding.UTF8.GetByteCount((string)context.Variables["pii-request-body"]) &gt; 1048576 ? 413 : 0)' />
+      </when>
+    </choose>
+    <choose>
+      <when condition='@((int)context.Variables["pii-input-status"] == 0)'>
+        <send-request mode="copy" response-variable-name="pii-response" timeout="5" ignore-error="true">
+          <set-url>http://127.0.0.1:8000/inspect</set-url>
+          <set-method>POST</set-method>
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-header name="X-PII-Filter-Key" exists-action="override">
+            <value>{{pii-filter-key}}</value>
+          </set-header>
+          <set-header name="api-key" exists-action="delete" />
+        </send-request>
+      </when>
+    </choose>
+    <!-- Parsing errors enter on-error; only validated metadata enters the summary. -->
+    <set-variable name="pii-summary" value='@{
+      var inputStatus = (int)context.Variables["pii-input-status"];
+      if (inputStatus != 0) { return inputStatus.ToString() + "|unknown|0|0|none"; }
+      var response = (IResponse)context.Variables["pii-response"];
+      if (response == null) { return "503|unknown|0|0|none"; }
+      if (response.StatusCode == 400 || response.StatusCode == 413 || response.StatusCode == 415)
+      {
+        return response.StatusCode.ToString() + "|unknown|0|0|none";
+      }
+      if (response.StatusCode != 200) { return "503|unknown|0|0|none"; }
+        var result = JObject.Parse(response.Body.As&lt;string&gt;());
+        var complete = result["inspectionComplete"];
+        var allowed = result["allowed"];
+        var version = result["ruleVersion"];
+        var count = result["matchCount"];
+        var duration = result["durationMs"];
+        var matches = result["matches"] as JObject;
+        if (complete == null || complete.Type != JTokenType.Boolean || !(bool)complete ||
+            allowed == null || allowed.Type != JTokenType.Boolean ||
+            version == null || version.Type != JTokenType.String ||
+            !System.Text.RegularExpressions.Regex.IsMatch((string)version, "^[A-Za-z0-9._-]{1,64}$") ||
+            count == null || count.Type != JTokenType.Integer ||
+            duration == null || duration.Type != JTokenType.Integer || matches == null)
+        {
+          return "503|unknown|0|0|none";
+        }
+        var total = (long)count;
+        var elapsed = (long)duration;
+        if (total &lt; 0 || total &gt; Int32.MaxValue || elapsed &lt; 0 || elapsed &gt; 5000 ||
+            matches.Count &gt; 32 || (bool)allowed != (total == 0))
+        {
+          return "503|unknown|0|0|none";
+        }
+        long sum = 0;
+        foreach (var match in matches.Properties())
+        {
+          if (!System.Text.RegularExpressions.Regex.IsMatch(match.Name, "^[A-Z][A-Z0-9_]{0,63}$") ||
+              match.Value.Type != JTokenType.Integer || (long)match.Value &lt; 1 ||
+              (long)match.Value &gt; Int32.MaxValue)
+          {
+            return "503|unknown|0|0|none";
+          }
+          sum += (long)match.Value;
+        }
+        if (sum != total) { return "503|unknown|0|0|none"; }
+        return ((bool)allowed ? "200" : "403") + "|" + (string)version + "|" +
+          total.ToString() + "|" + elapsed.ToString() + "|" +
+          (matches.Count == 0 ? "none" : String.Join(",", matches.Properties().Select(p =&gt; p.Name)));
+    }' />
+    <set-variable name="pii-status" value='@(Int32.Parse(((string)context.Variables["pii-summary"]).Split("|".ToCharArray())[0]))' />
+    <trace source="pii-filter" severity="information">
+      <message>PiiInspection</message>
+      <metadata name="EventName" value="PiiInspection" />
+      <metadata name="SubscriptionId" value='@((string)context.Variables["subscription-id"])' />
+      <metadata name="RequestId" value="@(context.RequestId.ToString())" />
+      <metadata name="StatusCode" value='@(((int)context.Variables["pii-status"]).ToString())' />
+      <metadata name="RuleVersion" value='@(((string)context.Variables["pii-summary"]).Split("|".ToCharArray())[1])' />
+      <metadata name="MatchCount" value='@(((string)context.Variables["pii-summary"]).Split("|".ToCharArray())[2])' />
+      <metadata name="DurationMs" value='@(((string)context.Variables["pii-summary"]).Split("|".ToCharArray())[3])' />
+      <metadata name="Categories" value='@(((string)context.Variables["pii-summary"]).Split("|".ToCharArray())[4])' />
+    </trace>
+    <choose>
+      <when condition='@((int)context.Variables["pii-status"] != 200)'>
+        <return-response>
+          <set-status code='@((int)context.Variables["pii-status"])' reason="Request rejected" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>@{
+            var status = (int)context.Variables["pii-status"];
+            var code = status == 403 ? "PII_DETECTED" :
+              status == 400 ? "INVALID_REQUEST" :
+              status == 413 ? "REQUEST_TOO_LARGE" :
+              status == 415 ? "UNSUPPORTED_CONTENT_TYPE" : "PII_INSPECTION_UNAVAILABLE";
+            var error = new JObject(
+              new JProperty("code", code),
+              new JProperty("message", status == 403 ?
+                "Request blocked by the PII policy. Remove personal data or secrets from the request context and try again." :
+                "The request could not be safely processed."),
+              new JProperty("requestId", context.RequestId.ToString()));
+            if (status == 403)
+            {
+              var summary = ((string)context.Variables["pii-summary"]).Split("|".ToCharArray());
+              error.Add(new JProperty("categories", new JArray(summary[4].Split(",".ToCharArray()))));
+              error.Add(new JProperty("matchCount", Int32.Parse(summary[2])));
+              error.Add(new JProperty("ruleVersion", summary[1]));
+            }
+            return new JObject(new JProperty("error", error)).ToString();
+          }</set-body>
+        </return-response>
+      </when>
+    </choose>
+    <set-variable name="pii-in-progress" value="@(false)" />
 
     <!-- Azure OpenAI v1 selects the deployment through the model request field. -->
     <set-body>@{
@@ -133,6 +270,17 @@
       <metadata name="ErrorReason" value="@(context.LastError.Reason)" />
       <metadata name="ErrorSource" value="@(context.LastError.Source)" />
     </trace>
+    <choose>
+      <when condition='@(context.Variables.GetValueOrDefault&lt;bool&gt;("pii-in-progress", false))'>
+        <return-response>
+          <set-status code="503" reason="PII inspection unavailable" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>{"error":{"code":"PII_INSPECTION_UNAVAILABLE","message":"The request could not be safely processed."}}</set-body>
+        </return-response>
+      </when>
+    </choose>
     <base />
   </on-error>
 </policies>

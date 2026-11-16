@@ -1,0 +1,99 @@
+{
+  "version": "2026-11-16.1",
+  "rules": [
+    {
+      "id": "KOR_RRN",
+      "enabled": true,
+      "pattern": "(?<![0-9])[0-9]{6}[- ]?[1-8][0-9]{6}(?![0-9])",
+      "validator": "none"
+    },
+    {
+      "id": "EMAIL",
+      "enabled": true,
+      "pattern": "(?i)(?<![\\w.+-])[A-Z0-9._%+-]{1,64}@[A-Z0-9.-]+\\.[A-Z]{2,}(?![\\w.-])",
+      "validator": "none",
+      "allowlist": ["test@example.com", "223556219+Copilot@users.noreply.github.com"]
+    },
+    {
+      "id": "KOR_PHONE",
+      "enabled": true,
+      "pattern": "(?<![\\w.+-])223556219\\+Copilot@users\\.noreply\\.github\\.com(?![\\w.-])(*SKIP)(*F)|(?<![0-9])(?=[+0-9])(?:\\+?82[- .]?)?(?:0?1[016789]|0?2|0?[3-6][1-5]|0?70|0?80)[- .]?[0-9]{3,4}[- .]?[0-9]{4}(?![0-9])",
+      "validator": "none"
+    },
+    {
+      "id": "PAYMENT_CARD",
+      "enabled": true,
+      "pattern": "(?<![0-9])(?:[0-9][ -]?){12,18}[0-9](?![0-9])",
+      "validator": "luhn"
+    },
+    {
+      "id": "BANK_ACCOUNT_CONTEXT",
+      "enabled": true,
+      "pattern": "(?<![0-9-])(?:[0-9]-?){9,13}[0-9](?![0-9-])",
+      "validator": "none",
+      "keywords": ["계좌", "account_number", "accountNumber", "bank_account", "bankAccount", "bank account"],
+      "context_window": 40
+    },
+    {
+      "id": "BANK_ACCOUNT_FIELD",
+      "enabled": true,
+      "pattern": "(?<![0-9-])(?:[0-9]-?){9,13}[0-9](?![0-9-])",
+      "validator": "none",
+      "fields": ["account_number", "accountNumber", "bank_account", "bankAccount", "계좌번호"]
+    },
+    {
+      "id": "GITHUB_TOKEN",
+      "enabled": true,
+      "pattern": "(?<![A-Za-z0-9_])(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{22,255})(?![A-Za-z0-9_])",
+      "validator": "none"
+    },
+    {
+      "id": "AWS_ACCESS_KEY_ID",
+      "enabled": true,
+      "pattern": "(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])",
+      "validator": "none"
+    },
+    {
+      "id": "PRIVATE_KEY",
+      "enabled": true,
+      "pattern": "-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----(?:\\r?\\n|\\\\r\\\\n|\\\\n|[ \\t])+(?:[A-Za-z0-9+/=\\r\\n \\t]|\\\\r|\\\\n){64,8192}-----END (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----",
+      "validator": "none"
+    },
+    {
+      "id": "JWT_TOKEN",
+      "enabled": true,
+      "pattern": "(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,2048}\\.[A-Za-z0-9_-]{10,4096}\\.[A-Za-z0-9_-]{16,1024}(?![A-Za-z0-9_.-])",
+      "validator": "none"
+    },
+    {
+      "id": "API_CREDENTIAL_ASSIGNMENT",
+      "enabled": true,
+      "pattern": "(?i)(?<![A-Za-z0-9])(?:api[_-]?key|access[_-]?token|client[_-]?secret)[\"']?[ \\t]*[:=][ \\t]*[\"'](?=[a-z0-9_-]{32,128}[\"'])(?=[a-z0-9_-]{0,127}[a-z])(?=[a-z0-9_-]{0,127}[0-9])[a-z0-9_-]{32,128}[\"']",
+      "validator": "none"
+    },
+    {
+      "id": "API_CREDENTIAL_FIELD",
+      "enabled": true,
+      "pattern": "(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]{0,127}[A-Za-z])(?=[A-Za-z0-9_-]{0,127}[0-9])[A-Za-z0-9_-]{32,128}(?![A-Za-z0-9_-])",
+      "validator": "none",
+      "fields": ["api_key", "apiKey", "API_KEY", "OPENAI_API_KEY", "AZURE_OPENAI_API_KEY", "access_token", "accessToken", "client_secret", "clientSecret"]
+    },
+    {
+      "id": "CONNECTION_STRING_SECRET",
+      "enabled": true,
+      "pattern": "(?i)(?<![\\w])(?:password|pwd|accountkey|sharedaccesskey)[ \\t]*=[ \\t]*(?!\\$\\{|\\{|<)[^\\s;\"'<>]{12,128}(?=[;\\s\"']|$)",
+      "validator": "none",
+      "keywords": ["Server=", "Data Source=", "Host=", "AccountName=", "DefaultEndpointsProtocol="],
+      "context_window": 128,
+      "allowlist": ["Password=YOUR_PASSWORD_HERE", "AccountKey=YOUR_ACCOUNT_KEY_HERE"]
+    },
+    {
+      "id": "INTERNAL_ID_FIELD_EXAMPLE",
+      "enabled": false,
+      "pattern": "EMP-[0-9]{4}",
+      "validator": "none",
+      "fields": ["employeeId"],
+      "allowlist": ["EMP-0000"]
+    }
+  ]
+}

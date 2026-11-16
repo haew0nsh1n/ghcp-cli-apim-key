@@ -16,7 +16,7 @@ function run(t, {args = ['1', 'dev-04', 'Developer "Four"'], scenario = {}} = {}
   const copy = path.join(root, 'scripts');
   fs.mkdirSync(bin);
   fs.mkdirSync(copy);
-  for (const name of ['common.sh', '2_create_subscription_key.sh']) {
+  for (const name of ['common.sh', '3_create_subscription_key.sh']) {
     fs.copyFileSync(path.join(scripts, name), path.join(copy, name));
   }
   fs.writeFileSync(path.join(root, '.env'),
@@ -61,7 +61,7 @@ if (args[0] === 'apim') {
   }
 }
 `, {mode: 0o700});
-  const result = spawnSync('/bin/bash', [path.join(copy, '2_create_subscription_key.sh'), ...args], {
+  const result = spawnSync('/bin/bash', [path.join(copy, '3_create_subscription_key.sh'), ...args], {
     cwd: root,
     env: {PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`, HOME: root},
     encoding: 'utf8',

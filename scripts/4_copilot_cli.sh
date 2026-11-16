@@ -2,7 +2,7 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: MIT
 #
-# Run Copilot CLI through the ACA gateway created by step 1.
+# Run Copilot CLI through the ACA gateway created by step 2.
 
 set +x
 set -euo pipefail
@@ -22,6 +22,7 @@ main() {
   load_env
   require_command az
   require_command copilot
+  require_command node
   require_env AZURE_SUBSCRIPTION_ID APIM_SUBSCRIPTION_ID APIM_NAME \
     OPENAI_ACCOUNT_NAME OPENAI_DEPLOYMENT_NAME
 
@@ -121,7 +122,7 @@ main() {
   fi
   echo "🚀 Copilot CLI 를 시작합니다..."
   echo ""
-  copilot "${copilot_args[@]}" || exit_code=$?
+  node "${SCRIPT_DIR}/copilot-provider.cjs" "${copilot_args[@]}" || exit_code=$?
   if [[ "${verbose}" == "true" ]]; then
     echo ""
     echo "   FINISHED_AT_UTC              = $(date -u '+%Y-%m-%dT%H:%M:%SZ')"

@@ -39,11 +39,26 @@ param tokenQuota string = '1000000'
 ])
 param tokenQuotaPeriod string = 'Monthly'
 
+@secure()
+@minLength(32)
+@description('PII sidecar authentication key. The default rotates on each infrastructure deployment; redeploy the gateway afterward.')
+param piiFilterKey string = newGuid()
+
 var uniqueSuffix = uniqueString(subscription().id, resourceGroup().id, resourcePrefix)
 var apimName = '${resourcePrefix}-apim-${uniqueSuffix}'
 var openAiName = take('${resourcePrefix}-aoai-${uniqueSuffix}', 64)
 var workspaceName = '${resourcePrefix}-law-${uniqueSuffix}'
 var appInsightsName = '${resourcePrefix}-appi-${uniqueSuffix}'
+var acrName = '${replace(resourcePrefix, '-', '')}acr${uniqueSuffix}'
+
+module registry 'modules/registry.bicep' = {
+  name: 'registry'
+  params: {
+    location: location
+    registryName: acrName
+    identityName: '${resourcePrefix}-pii-pull-${uniqueSuffix}'
+  }
+}
 
 module monitoring 'modules/monitoring.bicep' = {
   name: 'monitoring'
@@ -83,6 +98,7 @@ module apim 'modules/apim.bicep' = {
     tokensPerMinute: int(tokensPerMinute)
     tokenQuota: int(tokenQuota)
     tokenQuotaPeriod: tokenQuotaPeriod
+    piiFilterKey: piiFilterKey
   }
 }
 
@@ -104,3 +120,6 @@ output OPENAI_DEPLOYMENT_NAME string = openAiDeploymentName
 output APPLICATION_INSIGHTS_NAME string = appInsightsName
 output LOG_ANALYTICS_WORKSPACE_NAME string = workspaceName
 output APIM_USER_USAGE_WORKBOOK_NAME string = workbook.outputs.workbookName
+output ACR_NAME string = registry.outputs.registryName
+output ACR_LOGIN_SERVER string = registry.outputs.loginServer
+output ACR_PULL_IDENTITY_ID string = registry.outputs.pullIdentityId

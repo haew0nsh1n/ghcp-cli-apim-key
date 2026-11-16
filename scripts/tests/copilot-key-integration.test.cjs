@@ -18,6 +18,7 @@ test('installed Copilot CLI sends the subscription header and consumes a complet
     COPILOT_OFFLINE: 'true'
   };
   const requests = [];
+  let piiBlocked = false;
   const server = http.createServer((request, response) => {
     let body = '';
     request.setEncoding('utf8');
@@ -25,14 +26,18 @@ test('installed Copilot CLI sends the subscription header and consumes a complet
     request.on('end', () => {
       const key = request.headers['ocp-apim-subscription-key'];
       const valid = key === fakeKey;
-      const status = valid ? 200 : 401;
+      const status = valid ? piiBlocked ? 403 : 200 : 401;
       const parsed = JSON.parse(body);
       requests.push({
         path: request.url, status, model: parsed.model,
         hasHeader: Boolean(key), stream: parsed.stream
       });
       response.writeHead(status, {'Content-Type': 'application/json'});
-      response.end(JSON.stringify(valid ? {
+      response.end(JSON.stringify(valid && piiBlocked ? {error: {
+        code: 'PII_DETECTED', categories: ['EMAIL', 'KOR_PHONE'], matchCount: 2,
+        requestId: '12345678-1234-1234-1234-123456789abc',
+        message: 'synthetic-private-value-must-not-be-printed'
+      }} : valid ? {
         id: 'chatcmpl-local-key-auth',
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
@@ -72,7 +77,7 @@ verify_apim_key_auth
 cleanup_apim_session
 APIM_KEY="$TEST_KEY"
 configure_apim_copilot
-exec copilot --no-auto-update --disable-client-telemetry --disable-builtin-mcps \\
+exec node "$PROVIDER_SCRIPT" --no-auto-update --disable-client-telemetry --disable-builtin-mcps \\
   --trust-folder --available-tools --silent --stream off \\
   --secret-env-vars APIM_KEY,COPILOT_PROVIDER_API_KEY,COPILOT_PROVIDER_HEADERS \\
   -p "Return the local test marker without calling tools."
@@ -81,6 +86,7 @@ exec copilot --no-auto-update --disable-client-telemetry --disable-builtin-mcps 
         env: {
           ...env,
           COMMON_SCRIPT: path.join(scripts, 'common.sh'),
+          PROVIDER_SCRIPT: path.join(scripts, 'copilot-provider.cjs'),
           APIM_KEY: fakeKey,
           TEST_KEY: fakeKey,
           APIM_GATEWAY_URL: `http://127.0.0.1:${port}`,
@@ -113,7 +119,35 @@ exec copilot --no-auto-update --disable-client-telemetry --disable-builtin-mcps 
       assert.ok(request.stream === undefined || request.stream === false,
         'omitted or false stream must request a non-streaming completion');
     }
-    t.diagnostic(`CLI ${version.stdout.trim()}: loopback 401/401/200 and CLI completion verified`);
+    piiBlocked = true;
+    const rejection = await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [
+        path.join(scripts, 'copilot-provider.cjs'),
+        '--no-auto-update', '--disable-client-telemetry', '--disable-builtin-mcps',
+        '--trust-folder', '--available-tools', '--silent', '--stream', 'off',
+        '--secret-env-vars', 'COPILOT_PROVIDER_API_KEY,COPILOT_PROVIDER_HEADERS',
+        '-p', 'Return the local test marker without calling tools.'
+      ], {
+        cwd: root,
+        env: {...env, COPILOT_PROVIDER_BASE_URL: `http://127.0.0.1:${port}/openai`,
+          COPILOT_PROVIDER_API_KEY: fakeKey, COPILOT_PROVIDER_TYPE: 'openai',
+          COPILOT_PROVIDER_HEADERS: `Ocp-Apim-Subscription-Key: ${fakeKey}`,
+          COPILOT_PROVIDER_WIRE_API: 'completions', COPILOT_MODEL: 'gpt-5-mini',
+          COPILOT_PROVIDER_MODEL_ID: 'gpt-5-mini', COPILOT_PROVIDER_WIRE_MODEL: 'local-deployment'},
+        timeout: 90000
+      });
+      let output = '';
+      child.stdout.on('data', chunk => { output += chunk; });
+      child.stderr.on('data', chunk => { output += chunk; });
+      child.once('error', reject);
+      child.once('close', (status, signal) => resolve({status, signal, output}));
+    });
+    assert.notEqual(rejection.status, 0, `${rejection.signal || ''}\n${rejection.output}`);
+    assert.match(rejection.output, /\[APIM\] PII_DETECTED:.*not an API key authentication failure/);
+    assert.match(rejection.output, /categories=EMAIL,KOR_PHONE; matchCount=2; requestId=/);
+    assert.ok(!rejection.output.includes(fakeKey));
+    assert.ok(!rejection.output.includes('synthetic-private-value-must-not-be-printed'));
+    t.diagnostic(`CLI ${version.stdout.trim()}: loopback 401/401/200, completion and PII rejection verified`);
   } finally {
     server.closeAllConnections();
     if (server.listening) await new Promise(resolve => server.close(resolve));

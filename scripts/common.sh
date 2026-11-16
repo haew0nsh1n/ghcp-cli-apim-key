@@ -190,6 +190,11 @@ verify_apim_key_auth() {
     )"
     printf '   API_KEY_CHECK %-7s = HTTP %s\n' "${scenario}" "${response_code}"
     if [[ "${response_code}" != "${expected_code}" ]]; then
+      node - "${response_code}" "${APIM_VERIFY_DIR}/response.json" "${ROOT_DIR}/scripts/copilot-provider.cjs" <<'NODE'
+const fs = require('node:fs');
+const {reportGatewayError} = require(process.argv[4]);
+reportGatewayError(Number(process.argv[2]), fs.readFileSync(process.argv[3], 'utf8'));
+NODE
       echo "API key check failed: expected ${expected_code} for ${scenario}." >&2
       return 1
     fi

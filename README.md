@@ -1,4 +1,7 @@
-# 망분리 환경에서 APIM을 이용해서 Copilot CLI 실행하기
+---
+title: 망분리 환경에서 APIM을 이용해서 Copilot CLI 실행하기
+description: APIM Self-hosted Gateway와 ACA PII 필터 sidecar를 통한 Copilot CLI 모델 요청 검사·차단
+---
 
 ## 개요
 
@@ -10,11 +13,21 @@ Copilot CLI는 GitHub 로그인 없이 BYOK(Bring Your Own Key) offline 모드�
 개발자별로 발급한 APIM 구독 키로 Gateway를 호출하고, Gateway가 별도로 보관한 Azure OpenAI API 키로
 모델에 접근합니다. Azure OpenAI 백엔드 키를 개발자에게 직접 배포하지 않습니다.
 
+`feature/pii-filter` 브랜치에서는 같은 Azure Container App에 PII(개인 식별 정보) 필터 컨테이너를 추가해,
+모델로 전달하기 전에 요청 본문을 검사합니다.
+
+> [!NOTE]
+> PII 검사 통과 시에만 모델을 호출하며, 탐지 또는 검사 실패 시 요청을 차단합니다.
+> Azure 배포 순서는 `0_azd_up.sh → 1_build_pii_image.sh → 2_create_self_hosted_gateway.sh`입니다.
+> 코드 구현과 실제 배포·종단 간 검증은 별개입니다. 비운영 환경에서 차단 동작을 검증한 뒤 적용하세요.
+
 ### 제공 기능
 
 - Bicep과 스크립트를 이용한 APIM, Azure OpenAI, ACA Self-hosted Gateway 및 모니터링 리소스 구성
 - 개발자별 APIM 구독 생성과 구독 키 기반 모델 호출 인증
 - Gateway 정책을 통한 배포 모델 지정, 구독별 토큰 제한 및 사용량·오류 기록
+- 같은 ACA replica의 PII sidecar를 통한 요청 검사, 개인정보 탐지 시 차단 및 검사 실패 시 fail-closed 처리
+- Bicep ACR·이미지 pull identity 구성, ACR Build 스크립트와 JSON 파일 기반 탐지 규칙 관리
 - Copilot CLI 실행, 키 인증 검증 및 Workbook을 이용한 구독별 사용량 조회
 
 ### Disclaimer
@@ -28,32 +41,236 @@ Copilot CLI는 GitHub 로그인 없이 BYOK(Bring Your Own Key) offline 모드�
 
 ## 아키텍처
 
+### ACA 2개 컨테이너 구성
+
 ```mermaid
 flowchart LR
     cli["Copilot CLI / offline BYOK"]
-    subgraph aca["Azure Container App"]
-        gateway["공식 Self-hosted Gateway 컨테이너"]
+    subgraph aca["Azure Container App / 동일 replica"]
+        gateway["Self-hosted Gateway 컨테이너 / 8080"]
+        pii["PII 필터 sidecar / 8000"]
+        gateway -->|"localhost / 요청 본문 검사 / 필터 전용 키"| pii
+        pii -->|"허용·차단 판정 / 유형·건수"| gateway
     end
     apim["APIM 관리 영역 / API·정책·비밀 named value"]
     aoai["Azure OpenAI 모델 배포"]
     logs["Application Insights / Log Analytics / Workbook"]
+    blocked["모델 호출 없이 오류 반환"]
     cli -->|"HTTPS / 사용자 APIM 구독 키"| gateway
-    gateway -->|"HTTPS / 백엔드 OpenAI api-key"| aoai
+    gateway -->|"검사 통과 시에만 HTTPS / 백엔드 OpenAI api-key"| aoai
+    gateway -->|"PII 탐지 또는 검사 실패"| blocked
     apim -->|"구성 토큰으로 인증한 설정 동기화"| gateway
-    gateway -->|"SubscriptionId / 토큰 사용량 / 오류"| logs
+    gateway -->|"구독·요청 ID / PII 판정 / 토큰 사용량 / 오류"| logs
 ```
 
 화살표는 요청·설정·로그의 데이터 흐름이며, ACA 상자는 Container App 배포 경계입니다.
+같은 replica의 Gateway와 PII 필터가 네트워크를 공유하고 함께 배포·확장됩니다.
+외부 HTTPS ingress는 Gateway의 8080 포트에만 연결하며 PII 필터의 8000 포트는 외부에 노출하지 않습니다.
+`localhost`는 Gateway의 호출 경로이며, 필터가 loopback 주소로만 수신한다는 뜻은 아닙니다.
+필터는 ACA health probe 접근을 위해 `0.0.0.0:8000`으로 수신하고 필터 전용 키로 검사 API를 인증합니다.
 설정 동기화는 Gateway가 APIM 구성 서비스에 접속해 설정을 내려받는 방식입니다.
-모델 요청 경로는 `CLI → ACA Self-hosted Gateway → Azure OpenAI`입니다.
+요청 경로는 `CLI → Gateway → PII 검사 → Gateway → Azure OpenAI`입니다.
 
 ### 구성 요소의 역할
 
 - APIM은 API·정책·Product·구독 및 백엔드 키를 관리합니다.
-- Self-hosted Gateway는 동기화한 정책을 실행하고 Azure OpenAI를 직접 호출합니다. 모델 요청은 관리형 Gateway를 경유하지 않습니다.
+- Self-hosted Gateway는 동기화한 inbound 정책으로 PII 필터를 호출하고 검사 통과 시 Azure OpenAI를 직접 호출합니다. 모델 요청은 관리형 Gateway를 경유하지 않습니다.
+- PII 필터는 요청 본문의 개인정보를 로컬에서 탐지하고 유형·건수·허용 또는 차단 판정을 반환합니다. Azure OpenAI를 직접 호출하거나 원문을 저장하지 않습니다.
 
 이 샘플이 생성하는 API는 `self-hosted-openai`이며 별도 `openai` API는 생성하지 않습니다.
 모델은 독립 Azure OpenAI 계정의 배포이며 Foundry 프로젝트 리소스는 생성하지 않습니다.
+
+### PII 검사와 차단 동작
+
+동작은 자동 마스킹이 아니라 요청 차단입니다.
+코드·tool-call 인자를 자동 치환하면 Copilot 작업의 의미가 달라질 수 있기 때문입니다.
+마스킹 모드는 별도 검토 후 선택 기능으로 추가하며, 초기 구현에는 포함하지 않습니다.
+
+1. Gateway가 APIM 구독 키를 검증하고 관리형 Gateway 호출을 거절합니다.
+2. 요청 크기·형식을 검증하고 클라이언트 인증 정보를 백엔드 전달 대상에서 제거합니다.
+3. inbound 정책의 `send-request`로 `http://127.0.0.1:8000/inspect`를 호출합니다.
+   원본 본문을 복사해 검사하며 요청 본문을 마스킹된 데이터로 교체하지 않습니다.
+4. PII 필터가 본문을 검사하고 원문·실제 탐지값 없이 판정을 반환합니다.
+5. 금지된 PII가 있으면 `403`을 반환하고 Azure OpenAI를 호출하지 않습니다.
+6. 검사 통과 시 기존 모델 지정·토큰 제한·백엔드 인증 정책을 적용하고 Azure OpenAI로 전달합니다.
+
+검사 서비스 장애도 통과로 취급하지 않는 fail-closed 동작을 적용합니다.
+HTTP `200`만으로 허용하지 않고 판정 형식, 검사 완료 여부, 허용 여부까지 검증해야 합니다.
+
+| 상황 | Gateway 응답 | Azure OpenAI 호출 |
+|---|---|---|
+| 전체 검사 완료 및 허용 판정 | 기존 모델 응답 전달 | 호출 |
+| 정책상 금지된 PII·비밀정보 탐지 | `403` / `PII_DETECTED` | 호출하지 않음 |
+| 잘못된 JSON | `400` / `INVALID_REQUEST` | 호출하지 않음 |
+| 요청 본문 크기 초과 | `413` / `REQUEST_TOO_LARGE` | 호출하지 않음 |
+| 지원하지 않는 본문 형식 | `415` / `UNSUPPORTED_CONTENT_TYPE` | 호출하지 않음 |
+| 검사 시간 초과·서비스 장애·인증 실패·잘못되거나 불완전한 판정 | `503` / `PII_INSPECTION_UNAVAILABLE` | 호출하지 않음 |
+
+PII 차단 응답에는 실제 탐지값 대신 유형·총 건수·규칙 버전·요청 ID만 포함합니다.
+`message`는 개인정보 또는 비밀정보를 요청 문맥에서 제거하도록 안내합니다.
+
+```json
+{
+  "error": {
+    "code": "PII_DETECTED",
+    "message": "Request blocked by the PII policy. Remove personal data or secrets from the request context and try again.",
+    "requestId": "12345678-1234-1234-1234-123456789abc",
+    "categories": ["EMAIL", "KOR_PHONE"],
+    "matchCount": 2,
+    "ruleVersion": "2026-11-15.3"
+  }
+}
+```
+
+정상 판정의 빈 탐지 유형은 trace에 `none`으로 기록합니다.
+검사가 완료되지 않은 경우 규칙 버전은 `unknown`, 건수·시간은 `0`으로 기록하며,
+이 값은 검사 성공을 뜻하지 않습니다. HTTP 판정은 계속 fail-closed 오류를 유지합니다.
+
+### 검사 범위와 한계
+
+- PII 탐지 대상은 한국 주민등록번호 형태(날짜·체크섬 검증 없음), 이메일, 한국 전화번호, Luhn 검증을 통과한 카드번호
+- 계좌번호는 10~14자리 숫자(하이픈 허용)를 계좌 관련 문맥 또는 지정 JSON 필드와 조합해 탐지하며, 실제 발급·은행별 유효성을 보장하지 않음
+- 비밀정보는 GitHub 토큰·AWS 접근 키 ID 형식, 본문이 있는 PEM 개인키, 서명 부분이 있는 JWT 형식, API 자격 증명 대입 및 접속 문자열의 비밀 값 탐지
+- 초기 입력 형식은 현재 모델 API가 사용하는 UTF-8 JSON 요청 본문
+- 검사 범위는 전체 대화의 텍스트, 코드·파일에서 가져온 컨텍스트, tool 응답 및 tool-call 인자의 문자열 데이터
+- JSON 키·숫자값과 JSON으로 인코딩된 tool-call 인자에 포함된 식별정보도 검사
+- 본문 한도 1 MiB, 중첩 깊이 한도 64, 규칙당 최대 평가 시간 50 ms 및 전체 탐지 시간 한도 3초
+
+문자열로 인코딩된 JSON, 한글·영문 혼합, 구분자 변형과 긴 입력의 경계 사례를 검증해야 합니다.
+입력을 잘라 일부만 검사하거나 검사 실패를 탐지 0건으로 처리하지 않습니다.
+잘못된 JSON, 중복 키, 비표준 `NaN`·`Infinity`, 압축 본문은 거절합니다.
+Gateway는 선언된 Content-Length를 먼저 확인하고 버퍼링 후 실제 크기도 검사합니다.
+Content-Length가 없는 요청의 Gateway 버퍼링 자체를 제한하는 구성은 별도이며,
+필터는 스트림의 누적 바이트가 한도를 넘는 즉시 거절합니다.
+요청 본문을 임의로 변경하지 않고 허용된 요청의 JSON 구조와 tool-call 의미를 보존합니다.
+
+이름·주소·여권번호, 임의 형식의 비밀번호·API 키와 모든 공급자의 토큰 탐지는 구현 범위 밖입니다.
+비밀정보 규칙은 형식 기반 휴리스틱이며 실제 발급·유효성·JWT 서명을 확인하지 않습니다.
+URL path·query·headers, 이미지·파일 원본과 모델 응답도 이 본문 필터로 보호되지 않습니다.
+필요하면 한국어 NER, 추가 공급자별 비밀정보 탐지 및 콘텐츠별 검사 경로를 후속으로 검토합니다.
+규칙 기반 탐지에는 오탐·미탐이 있으므로 PII 전체 차단이나 망분리 준수를 보장하지 않습니다.
+
+초기 검증은 기존 CLI의 기본 비스트리밍 응답을 기준으로 합니다.
+`stream: true`여도 JSON 요청 본문은 사전 검사 대상이지만, SSE 응답의 PII 검사는 별도 설계가 필요합니다.
+CLI의 직접 외부 호출·MCP 통신과 Gateway를 우회한 모델 호출도 별도 통제 대상입니다.
+
+### 배포·운영과 검증
+
+공식 Gateway 이미지는 유지하고 PII 필터 이미지만 별도로 빌드해 동일 ACA 앱에 추가합니다.
+현재 Gateway의 1 vCPU·2 GiB와 replica 1개 구성은 초기 기준으로 유지하고,
+필터에는 0.5 vCPU·1 GiB를 할당합니다. 운영 값은 본문 크기·동시 요청 부하 시험으로 결정합니다.
+두 컨테이너의 readiness를 확인하고, 확장·장애·revision 교체가 함께 일어나는 영향을 검증합니다.
+필터 HTTP 서버의 동시 연결 한도는 32이며, 과부하의 `503`도 모델 호출 없이 차단합니다.
+
+필터 호출 키는 백엔드 키·구독 키·Gateway 구성 토큰과 별도로 관리합니다.
+ACA secret과 APIM 비밀 named value에 같은 필터 키를 저장하며,
+원문·키를 소스·로그·명령 인수에 노출하지 않고 회전 시 양쪽 설정의 전환을 검증합니다.
+
+Gateway는 `PiiInspection` 이벤트로 구독 ID·요청 ID·탐지 유형·건수·HTTP 판정·검사 시간·규칙 버전을 기록합니다.
+기존 본문·인증 헤더 로그 비활성화는 유지하고, PII 필터 로그에도 원문·탐지값을 남기지 않습니다.
+차단 요청은 모델 호출·모델 토큰 사용량과 구분해 집계합니다.
+
+필터 구현과 Docker 빌드 컨텍스트는 [pii-filter/](pii-filter/)에 있습니다.
+기존 [API 정책](apim/policies/openai-policy.xml)에 검사 단계를 병합했으며,
+참고용 폴더의 코드·스크립트·이미지를 실행하거나 배포하지 않습니다. 참고 폴더를 삭제해도 동작합니다.
+
+운영 적용 전에 다음 항목을 확인합니다.
+
+- 차단 모드, 초기 탐지 유형, 1 MiB 한도 및 오류 응답에 대한 검토
+- 기존 인증·모델 지정·토큰 제한·사용량 기록의 유지
+- 실제 PII가 아닌 합성 데이터로 한국어·코드·중첩 JSON·숫자 식별정보 검사
+- echo backend로 차단·검사 장애 시 백엔드 호출 0건 확인
+- 허용 요청의 본문 의미와 CLI tool-call 동작 보존
+- 필터 키 불일치·시간 초과·과대 요청·readiness 실패 및 로그 비노출 검증
+
+### 코드와 분리한 PII 규칙 관리
+
+권장 방식은 승인된 JSON 규칙 파일을 버전 관리하고 배포 시 ACA에 주입하는 것입니다.
+[rules.json](pii-filter/rules.json)의 `version`과 각 규칙의 `id`, `enabled`, `pattern`, `validator`를 편집합니다.
+`validator`는 `none` 또는 `luhn`을 지원하며, 패턴 추가·수정·비활성화에는 Python 코드 변경이 필요 없습니다.
+추가 조건도 규칙별로 설정할 수 있습니다.
+
+- `keywords`: 매치와 앞뒤 `context_window`자 안에 하나 이상 있어야 하는 문자열 목록. NFKC 정규화 후 대소문자를 구분하지 않는 부분 문자열로 검사합니다.
+- `context_window`: 매치 앞뒤 문맥 길이. 기본 80자, 범위 0~1024자이며 `keywords`와 함께 사용합니다. 문맥은 같은 문자열 안에서만 찾습니다.
+- `fields`: 검사할 JSON 필드 이름 목록. NFKC 정규화 후 대소문자를 구분해 정확히 비교합니다. 해당 필드의 스칼라 값과 배열 원소에 적용되며, 하위 객체는 자체 필드 이름을 사용합니다.
+- `allowlist`: 해당 규칙에서 제외할 정확한 매치 문자열 목록. NFKC 정규화 후 대소문자를 구분하며, 다른 규칙의 탐지는 면제하지 않습니다.
+
+`keywords`와 `fields`를 함께 지정하면 두 조건을 모두 만족해야 합니다.
+두 목록은 각각 최대 32개이며 지정 시 비어 있을 수 없습니다.
+`allowlist`는 최대 128개이고 빈 목록도 허용합니다. 각 항목은 공백만으로 구성할 수 없으며 최대 256자입니다.
+조건을 생략한 기존 규칙은 계속 전체 JSON 키와 값을 검사합니다.
+`fields`는 자연어 안의 필드 표기가 아니라 실제 JSON 구조에만 적용됩니다.
+JSON으로 인코딩된 도구 인자는 파싱한 내부 필드에도 조건을 적용합니다.
+
+기본 파일에는 계좌번호 문맥·필드 규칙과 비밀정보 규칙을 활성 상태로 포함합니다.
+`INTERNAL_ID_FIELD_EXAMPLE`은 조직별 사번 체계를 설정하기 위한 비활성 예시입니다.
+허용 목록은 승인된 테스트 값으로 좁게 유지하고 실제 개인정보를 저장소에 넣지 마세요.
+새 필드를 처음 지원하는 이번 엔진 변경은 이미지 빌드와 재배포가 필요합니다.
+갱신된 이미지 배포 이후에는 위 설정만 변경할 때 이미지 재빌드가 필요 없습니다.
+
+#### 코드 생성 요청의 기본 정책
+
+`email`, `phone`, `password`, `api_key` 같은 변수명·타입 선언 자체는 차단하지 않습니다.
+코드, SQL, fixture, 로그와 도구 출력에 포함된 실제 값의 형식과 문맥을 검사하며 소스 코드 AST를 분석하지는 않습니다.
+
+- 이메일은 로컬 부분(`@` 앞)이 1~64자인 형식을 검사하고, 정확한 `test@example.com`과 공개 Copilot 봇 주소 `223556219+Copilot@users.noreply.github.com`만 기본 예외입니다. 두 주소 모두 NFKC 정규화 후 대소문자를 구분합니다. 도메인 전체를 허용하지 않으며, 다른 이메일이 함께 있으면 계속 탐지합니다.
+- CLI의 기본 커밋 공동작성자 안내에 포함된 봇 주소가 오탐되지 않도록, 전화번호 규칙은 정확한 봇 이메일 범위에만 `regex`의 `(*SKIP)(*F)`를 적용합니다. 이메일 밖의 같은 숫자, 다른 봇·사용자 주소, 접두사나 도메인 접미사를 붙인 유사 주소는 면제하지 않습니다. system 메시지 전체를 면제하지도 않습니다.
+- 카드·전화·주민번호는 테스트처럼 보여도 기존 규칙을 적용합니다. 합성 데이터나 주석이라는 이유로 코드 블록 전체를 면제하지 않습니다.
+- 계좌 문맥은 같은 문자열의 앞뒤 40자 안에서 `계좌`, `account_number`, `accountNumber`, `bank_account`, `bankAccount`, `bank account`를 찾습니다.
+- 구조화된 계좌값은 `account_number`, `accountNumber`, `bank_account`, `bankAccount`, `계좌번호` 필드를 검사합니다. 필드명만 있고 값이 없으면 탐지하지 않습니다.
+- 일반 API 자격 증명은 지정된 키 이름과 32~128자의 영문·숫자가 모두 있는 값(하이픈·밑줄 허용)을 조합합니다. 따옴표로 감싼 코드 대입이나 지정 JSON 필드에 적용하며, 같은 길이의 일반 체크섬은 이것만으로 차단하지 않습니다.
+- 접속 문자열은 `Server=`, `Data Source=`, `Host=`, `AccountName=`, `DefaultEndpointsProtocol=` 문맥과 12~128자의 비밀 값을 조합합니다.
+- `Password=YOUR_PASSWORD_HERE`, `AccountKey=YOUR_ACCOUNT_KEY_HERE`는 접속 문자열 규칙의 정확한 예외입니다. 환경변수 참조 `${...}`나 `<...>` 템플릿은 이 규칙의 실제 값으로 취급하지 않습니다.
+
+서명·키 형식과 일치하는 테스트 토큰은 기본적으로 차단합니다.
+예외 값은 규칙별로 평가되므로 다른 규칙이 탐지하면 요청은 계속 차단됩니다.
+은행별 형식, 공급자별 토큰과 한국어 문맥은 운영 데이터 대신 합성 평가 데이터로 오탐·미탐을 확인하세요.
+이름·주소 NER은 아직 포함하지 않았습니다.
+
+이 봇 주소 오탐 수정은 규칙 파일만 변경하므로 2단계로 규칙을 다시 주입한 뒤 4단계를 실행하면 됩니다.
+0단계 인프라 배포와 1단계 이미지 재빌드는 필요 없습니다.
+
+```json
+{
+  "version": "custom.1",
+  "rules": [
+    {
+      "id": "INTERNAL_ID",
+      "enabled": true,
+      "pattern": "EMP-[0-9]{4}",
+      "validator": "none"
+    }
+  ]
+}
+```
+
+위 JSON은 형식 예제이며 기본 개인정보 규칙 전체를 대체하면 기존 탐지 유형이 사라집니다.
+기본 규칙을 유지한 채 필요한 규칙을 추가하고, 버전과 평가 테스트도 함께 갱신하세요.
+모든 규칙 비활성화, 중복 ID, 잘못된 정규식은 필터 시작 실패로 처리합니다.
+
+[Gateway 배포 스크립트](scripts/2_create_self_hosted_gateway.sh)는 파일 내용을 ACA의 `pii-rules` secret에 저장하고
+필터의 `PII_RULES_JSON` 환경변수에 `secretRef`로 주입합니다. 규칙은 시작 시 한 번 검증·로드합니다.
+규칙만 바꿀 때는 이미지 재빌드 없이 같은 digest 이미지로 앱을 갱신·재시작합니다.
+
+```bash
+# 기본 파일을 수정한 경우
+./scripts/2_create_self_hosted_gateway.sh
+
+# 별도 승인 파일을 사용하는 경우: 실제 azd 환경 이름을 지정합니다.
+AZURE_ENV_NAME=dev PII_RULES_FILE=/absolute/path/to/approved-rules.json \
+  ./scripts/2_create_self_hosted_gateway.sh
+```
+
+이 스크립트는 Gateway 구성 토큰도 함께 갱신합니다.
+운영 중 규칙 교체는 단일 replica의 일시 중단을 고려해 수행하고 이전 승인 파일로 복구할 수 있게 보관하세요.
+패턴은 Python `regex` 문법을 사용하며, 실행 시간 초과는 허용이 아니라 검사 실패로 처리합니다.
+정규식만으로 이름·주소 등 문맥 기반 PII를 정확하게 탐지할 수는 없습니다.
+
+중앙 관리가 필요하면 Azure App Configuration 또는 Blob Storage의 승인된 규칙 버전을
+배포 파이프라인이 내려받아 `PII_RULES_FILE`로 전달하는 방식을 권장합니다.
+이 중앙 저장소 연동·자동 동기화는 현재 구현하지 않았습니다.
+필터가 요청마다 원격 규칙을 조회하는 방식은 피하고, 버전 고정·검증·승인·롤백 절차를 유지하세요.
+새 검증 알고리즘이나 NER 엔진 추가는 JSON 패턴 변경과 별개로 코드·이미지 변경이 필요합니다.
 
 ### 인증과 자격 증명
 
@@ -63,6 +280,11 @@ flowchart LR
 | Copilot CLI → Self-hosted Gateway | `Ocp-Apim-Subscription-Key` 헤더의 APIM 구독 키 |
 | Self-hosted Gateway → Azure OpenAI | APIM의 비밀 named value `openai-backend-key`에 저장한 Azure OpenAI API 키를 `api-key` 헤더로 전달 |
 | Gateway → APIM 구성 서비스 | ACA의 `gateway-token` secret에 보관한 별도의 Gateway 연결 토큰으로 구성·정책 동기화 |
+
+Gateway → PII 필터 호출에는 `X-PII-Filter-Key` 헤더를 사용합니다.
+필터 전용 키는 Bicep이 APIM 비밀 named value `pii-filter-key`로 생성하고,
+Gateway 배포 스크립트가 조회해 ACA secret에 저장합니다.
+사용자의 APIM 구독 키나 Azure OpenAI 백엔드 키를 필터 인증에 재사용하지 않습니다.
 
 Gateway는 API의 `subscriptionRequired: true` 설정에 따라 APIM 기본 구독 키 검증을 수행합니다.
 키가 없거나 잘못되면 `401`로 거절하며, 정책 XML에서 동일한 키 비교를 다시 구현하지 않습니다.
@@ -79,6 +301,9 @@ Azure 리소스 관리 로그인은 모델 API 호출 인증과 별개입니다.
 - 리소스 그룹, APIM, Azure OpenAI 및 모니터링 리소스를 생성할 권한
 - APIM/ACA/모델 조회 및 APIM `subscriptions/read`, `subscriptions/listSecrets/action` 권한
 - Bicep 배포 주체의 Azure OpenAI `accounts/listKeys/action` 권한
+- ACR·user-assigned identity 생성과 ACR 범위의 `AcrPull` 역할 할당 권한
+- 이미지 빌드 주체의 ACR Build·repository 메타데이터 조회 권한 및 ACA 배포 주체의 identity 할당 권한
+- Gateway 배포 주체의 APIM `namedValues/listValue/action` 권한
 - Workbook 조회를 위한 대상 Log Analytics 로그 데이터 조회 권한
 
 CLI 실행 계정에도 위의 리소스 조회·구독 키 읽기 권한이 필요합니다.
@@ -92,15 +317,18 @@ Bash 3.2 이상과 다음 CLI들을 준비하세요.
 
 | 도구·명령어 | 필요한 기능과 용도 | 사용 스크립트 |
 |---|---|---|
-| Azure Developer CLI (`azd`) | 로그인 완료, `azd env set --file` 지원, 환경값 조회 및 Bicep 인프라 배포 | [0_azd_up.sh](scripts/0_azd_up.sh), [1_create_self_hosted_gateway.sh](scripts/1_create_self_hosted_gateway.sh), [2_create_subscription_key.sh](scripts/2_create_subscription_key.sh), [3_copilot_cli.sh](scripts/3_copilot_cli.sh) |
-| Azure CLI (`az`) | 로그인 완료, `az containerapp` 명령 지원, Azure 리소스·Gateway·APIM 구독 관리 및 키 조회 | [1_create_self_hosted_gateway.sh](scripts/1_create_self_hosted_gateway.sh), [2_create_subscription_key.sh](scripts/2_create_subscription_key.sh), [3_copilot_cli.sh](scripts/3_copilot_cli.sh) |
-| GitHub Copilot CLI (`copilot`) | `COPILOT_PROVIDER_HEADERS` 지원 확인 및 BYOK offline 실행 | [3_copilot_cli.sh](scripts/3_copilot_cli.sh) |
-| Node.js (`node`) | 입력 검증, JSON 처리, UUID 생성 및 모델 응답 검증 | [1_create_self_hosted_gateway.sh](scripts/1_create_self_hosted_gateway.sh), [2_create_subscription_key.sh](scripts/2_create_subscription_key.sh), [3_copilot_cli.sh](scripts/3_copilot_cli.sh)의 `--verify-only` |
-| `curl` | Gateway 상태 확인 및 구독 키 인증 HTTP 검증 | [1_create_self_hosted_gateway.sh](scripts/1_create_self_hosted_gateway.sh), [3_copilot_cli.sh](scripts/3_copilot_cli.sh)의 `--verify-only` |
+| Azure Developer CLI (`azd`) | 로그인 완료, `azd env set --file` 지원, 환경값 조회 및 Bicep 인프라 배포 | [0_azd_up.sh](scripts/0_azd_up.sh), [1_build_pii_image.sh](scripts/1_build_pii_image.sh), [2_create_self_hosted_gateway.sh](scripts/2_create_self_hosted_gateway.sh), [3_create_subscription_key.sh](scripts/3_create_subscription_key.sh), [4_copilot_cli.sh](scripts/4_copilot_cli.sh) |
+| Azure CLI (`az`) | 로그인 완료, `az containerapp` 명령 지원, ACR Build 및 Azure 리소스·Gateway·APIM 구독 관리·키 조회 | [1_build_pii_image.sh](scripts/1_build_pii_image.sh), [2_create_self_hosted_gateway.sh](scripts/2_create_self_hosted_gateway.sh), [3_create_subscription_key.sh](scripts/3_create_subscription_key.sh), [4_copilot_cli.sh](scripts/4_copilot_cli.sh) |
+| GitHub Copilot CLI (`copilot`) | `COPILOT_PROVIDER_HEADERS` 지원 확인 및 BYOK offline 실행 | [4_copilot_cli.sh](scripts/4_copilot_cli.sh) |
+| Node.js (`node`) | 입력 검증, JSON 처리, UUID 생성, CLI 로컬 릴레이 및 모델 응답 검증 | [1_build_pii_image.sh](scripts/1_build_pii_image.sh), [2_create_self_hosted_gateway.sh](scripts/2_create_self_hosted_gateway.sh), [3_create_subscription_key.sh](scripts/3_create_subscription_key.sh), [4_copilot_cli.sh](scripts/4_copilot_cli.sh) |
+| `curl` | Gateway 상태 확인 및 구독 키 인증 HTTP 검증 | [2_create_self_hosted_gateway.sh](scripts/2_create_self_hosted_gateway.sh), [4_copilot_cli.sh](scripts/4_copilot_cli.sh)의 `--verify-only` |
 
-`azd`는 0단계에서 필수이며, 1·2·3단계에서는 필요한 환경변수가 없을 때 azd 환경값 조회에 사용합니다.
-3단계의 일반 CLI 실행은 `node`와 `curl`을 직접 호출하지 않지만,
-`--verify-only`에서는 둘 다 필요합니다. 이 검증 모드도 CLI 설정 지원 여부를 확인하므로 `copilot`이 필요합니다.
+이미지 빌드 스크립트도 Azure CLI·Node.js와 공통 환경 로드 규칙을 사용합니다.
+ACR Build를 사용하므로 로컬 Docker CLI·데몬 없이 이미지를 빌드·저장할 수 있습니다.
+
+`azd`는 0단계에서 필수이며, 1~4단계에서는 필요한 환경변수가 없을 때 azd 환경값 조회에 사용합니다.
+4단계의 일반 CLI 실행은 로컬 릴레이를 위해 `node`가 필요하며,
+`--verify-only`에서는 `curl`도 필요합니다. 이 검증 모드도 CLI 설정 지원 여부를 확인하므로 `copilot`이 필요합니다.
 
 기본 OS 명령인 `env`, `dirname`, `date`, `mktemp`, `rm`, `rmdir`, `sleep`도 사용합니다.
 Bicep은 `azd up` 배포 과정에서 사용하며, 스크립트가 별도 `bicep` 명령을 직접 호출하지는 않습니다.
@@ -143,6 +371,11 @@ Gateway 컨테이너는 ACA에서 실행하므로 로컬 Docker CLI는 필요하
 
 ## 배포 및 실행 순서
 
+> [!NOTE]
+> 인프라 배포는 PII 검사 정책을 먼저 적용합니다.
+> 이미지 빌드와 2컨테이너 앱 배포를 완료하기 전에는 모델 요청이 `503`으로 차단될 수 있습니다.
+> 기존 환경 업그레이드는 작업 시간을 확보한 뒤 아래 순서대로 진행하세요.
+
 ### 0. 설정과 APIM·모델 배포
 
 먼저 대상 환경에서 OpenAI API 키 인증을 허용하는지 확인하세요.
@@ -171,6 +404,8 @@ azd env new dev  # 최초 한 번만 실행합니다.
 - 작업 영역 기반 Application Insights, Log Analytics, 사용량 Workbook 및 APIM 서비스의 GatewayLogs 진단 설정
 - API 키 인증을 활성화한 Azure OpenAI 계정 및 모델 배포
 - APIM 서비스 및 비밀 named value `openai-backend-key`(Azure OpenAI primary key 저장)
+- PII 필터 전용 비밀 named value `pii-filter-key`
+- Basic ACR(admin 계정 비활성화), 이미지 pull용 user-assigned identity와 ACR 범위의 `AcrPull` 역할
 - 구독 필수 `self-hosted-openai` API와 `POST /self-hosted/openai/chat/completions` 통합 정책
 - 구독 필수 Product `copilot-cli`(API를 묶는 단위)와 API 연결
 
@@ -181,7 +416,7 @@ Product ID `copilot-cli`와는 별개이며, Azure 구독 ID나 인증 키 자�
 `dev-1`로 지정하면 해당 구독의 키로 호출하고 사용량과 토큰 한도도 `dev-1` 기준으로 관리합니다.
 환경값이 없을 때 인프라 매개변수의 기본값은 `copilot-cli`이지만, CLI 실행에는 `APIM_SUBSCRIPTION_ID` 설정이 필요합니다.
 배포 출력에도 이 식별자만 포함되며, 해당 subscription이 생성되었음을 의미하지는 않습니다.
-새 환경에서는 2단계 스크립트로 subscription을 생성한 뒤 CLI를 실행하세요.
+새 환경에서는 3단계 스크립트로 subscription을 생성한 뒤 CLI를 실행하세요.
 키 값은 배포 출력에 포함하지 않습니다.
 설정 예제의 모델은 `gpt-5-mini`, 버전 `2025-08-07`입니다.
 모델 배포는 `OnceCurrentVersionExpired` 자동 버전 업그레이드를 허용하므로 실제 버전은 이후 달라질 수 있습니다.
@@ -191,19 +426,37 @@ Product ID `copilot-cli`와는 별개이며, Azure 구독 ID나 인증 키 자�
 
 #### 환경 설정 로드 규칙
 
-1·2·3단계의 [공통 모듈](scripts/common.sh)은 다음 순서로 값을 읽습니다.
+1~4단계의 [공통 모듈](scripts/common.sh)은 다음 순서로 값을 읽습니다.
 
 - `AZURE_ENV_NAME`이 없으면 루트 `.env`를 로드하며, 같은 이름의 기존 환경변수도 덮어씁니다.
 - `AZURE_ENV_NAME`이 있으면 루트 `.env`를 읽지 않고 프로세스 환경변수를 사용합니다.
 - 필수 설정이 비어 있을 때만 `azd env get-value`로 조회하며, azd 환경 전체를 일괄로 불러오지는 않습니다.
 
-### 1. ACA self-hosted gateway 구성
+### 1. PII sidecar 이미지 빌드와 ACR 저장
+
+0단계 후 다음을 실행합니다.
 
 ```bash
-./scripts/1_create_self_hosted_gateway.sh
+./scripts/1_build_pii_image.sh
 ```
 
-[1_create_self_hosted_gateway.sh](scripts/1_create_self_hosted_gateway.sh)는 실제 APIM의
+[1_build_pii_image.sh](scripts/1_build_pii_image.sh)는 Bicep 출력 `ACR_NAME`을 조회하고
+[pii-filter/](pii-filter/)만 ACR Build에 전달해 `linux/amd64` 이미지를 빌드·저장합니다.
+timestamp와 랜덤 suffix의 고유 태그로 빌드한 뒤 digest를 조회합니다.
+`<login-server>/pii-filter@sha256:<digest>` 형태의 `PII_FILTER_IMAGE`를 출력하고,
+azd가 있으면 선택한 환경에도 저장합니다. 빌드·digest 조회 실패 시 성공 이미지 설정을 저장하지 않습니다.
+
+azd 환경 없이 실행한다면 출력된 실제 `PII_FILTER_IMAGE`를 환경변수로 설정해야 합니다.
+`latest`나 변경 가능한 태그는 Gateway 배포 스크립트에서 허용하지 않습니다.
+규칙 파일만 변경하는 경우 이 빌드는 필요하지 않습니다.
+
+### 2. ACA self-hosted gateway와 PII sidecar 구성
+
+```bash
+./scripts/2_create_self_hosted_gateway.sh
+```
+
+[2_create_self_hosted_gateway.sh](scripts/2_create_self_hosted_gateway.sh)는 실제 APIM의
 리소스 그룹과 지역을 조회하고 다음을 구성합니다.
 `Microsoft.App` 리소스 공급자와 필요한 관리 권한은 미리 준비하세요.
 
@@ -213,14 +466,27 @@ Product ID `copilot-cli`와는 별개이며, Azure 구독 ID나 인증 키 자�
 - 신규 환경과 앱의 `Consumption` profile 구성
 - 공식 `mcr.microsoft.com/azure-api-management/gateway:v2` 이미지
 - Gateway 연결 토큰의 ACA secret 저장 및 `secretRef` 참조
-- 1 vCPU, 2 GiB 메모리, 최소·최대 replica 1개와 readiness probe
+- ACR digest 이미지의 PII sidecar, pull identity 연결 및 Gateway와 필터의 readiness probe
+- 필터 전용 키·JSON 규칙의 ACA secret 저장 및 `secretRef` 참조
+- Gateway 1 vCPU·2 GiB, 필터 0.5 vCPU·1 GiB, 최소·최대 replica 1개
 
 API·operation·Product 연결·정책·진단은 Bicep에서 관리합니다.
 이 스크립트는 Gateway 등록·API 연결과 ACA 앱 설정을 갱신하며, API 정책이나 백엔드 키를 갱신하지 않습니다.
+`ACR_NAME`, `ACR_PULL_IDENTITY_ID`, digest 기반 `PII_FILTER_IMAGE`가 필요합니다.
+기본 규칙은 [rules.json](pii-filter/rules.json)이며 `PII_RULES_FILE`로 다른 승인 파일을 지정할 수 있습니다.
 
-스크립트는 Gateway 상태와 구독 키 없는 요청의 거절 여부를 확인합니다. 모델 호출 검증은 3단계에서 합니다.
+앱 생성·업데이트는 생성한 JSON을 ARM REST `PUT`으로 직접 전달합니다.
+일부 Azure CLI `containerapp` 확장의 YAML 업데이트가 빈 사용자 할당 ID 객체를 제거하는 문제를 피하기 위한 방식입니다.
+스크립트는 provisioning 완료(최대 약 10분)를 기다린 뒤 새 revision의 readiness,
+Gateway 상태와 구독 키 없는 요청의 거절 여부를 확인합니다. 배포 실패·취소·시간 초과는 오류로 종료합니다.
+모델 호출 검증은 4단계에서 하며 PII 차단·장애 검증은 별도로 수행해야 합니다.
 같은 이름으로 재실행하면 환경을 재사용하고 앱과 연결 토큰을 갱신·재시작합니다.
 이름과 이미지는 [.env.example](.env.example)의 `SELF_HOSTED_GATEWAY_*`로 지정할 수 있습니다.
+
+인프라 배포와 이미지 빌드가 성공한 뒤 ACA 배포만 실패했다면 이 2단계부터 다시 실행하세요.
+코드·이미지 변경이 없으면 0단계나 1단계를 반복할 필요가 없습니다.
+이전에 다른 프로젝트에서 설정한 `ACR_NAME`, `ACR_PULL_IDENTITY_ID`, `PII_FILTER_IMAGE`가 셸에 남아 있으면
+값을 해제하고 현재 azd 환경의 배포 출력을 사용하세요.
 
 ![APIM Self-hosted Gateway 연결 상태와 배포 설정](images/1.png)
 
@@ -240,20 +506,20 @@ ACA 및 gateway 요금과, Bicep 밖에서 생성한 후속 리소스의 정리 
   영향을 주므로 최소 권한으로 제한하세요. `secret: true`는 신뢰할 수 없는 운영자로부터 키를 격리하지 않습니다.
 - Azure OpenAI 키를 CLI나 ACA 사용자 환경변수에 넣지 않습니다. 키 값은 승인된 비밀 관리 경로로만 취급하세요.
 
-### 2. 개발자별 subscription과 키 생성
+### 3. 개발자별 subscription과 키 생성
 
-[2_create_subscription_key.sh](scripts/2_create_subscription_key.sh)로 개발자별 APIM 구독을 생성합니다.
+[3_create_subscription_key.sh](scripts/3_create_subscription_key.sh)로 개발자별 APIM 구독을 생성합니다.
 선택한 Product 범위의 활성 subscription이 이미 있으면 이 단계를 건너뛸 수 있습니다.
 호출 형식은 `[개수] [ID 접두사] [표시 이름]`입니다. 개수를 생략하면 1개를 생성합니다.
 개수는 양의 정수여야 하며 ID 접두사를 생략하면 UUID 기반 고유 접두사를 자동 생성합니다.
 아래 명령은 각각 독립된 예시이며, 연속해서 실행하는 순서가 아닙니다.
 
 ```bash
-./scripts/2_create_subscription_key.sh 1 dev-1           # 설정 예제의 ID로 1개 생성
-./scripts/2_create_subscription_key.sh                   # 고유 ID로 1개 생성
-./scripts/2_create_subscription_key.sh 3                 # 고유 접두사로 3개 생성
-./scripts/2_create_subscription_key.sh 3 dev "Developer" # dev-1, dev-2, dev-3 생성
-./scripts/2_create_subscription_key.sh 1 dev-04 "Developer 04"
+./scripts/3_create_subscription_key.sh 1 dev-1           # 설정 예제의 ID로 1개 생성
+./scripts/3_create_subscription_key.sh                   # 고유 ID로 1개 생성
+./scripts/3_create_subscription_key.sh 3                 # 고유 접두사로 3개 생성
+./scripts/3_create_subscription_key.sh 3 dev "Developer" # dev-1, dev-2, dev-3 생성
+./scripts/3_create_subscription_key.sh 1 dev-04 "Developer 04"
 ```
 
 1개일 때는 지정한 ID를 그대로 사용하고, 여러 개일 때는 `-1`, `-2` 등 일련번호를 붙입니다.
@@ -276,28 +542,28 @@ APIM 조회 및 Product·subscription 읽기와 subscription 쓰기 권한이 �
 이 스크립트로 생성한 subscription은 Bicep 관리 대상이 아니므로 중지·회수·정리도 별도 관리합니다.
 이 스크립트는 `.env`나 azd의 기본 subscription ID를 변경하지 않습니다.
 
-### 3. 키 인증 검증 및 Copilot CLI 실행
+### 4. 키 인증 검증 및 Copilot CLI 실행
 
 Gateway에 새 구독 설정이 동기화될 때까지 기다린 뒤, 설정된 구독으로 검증하고 CLI를 실행합니다.
 대화형 실행과 `-p` 질문 실행은 필요에 따라 선택하세요.
 
 ```bash
-./scripts/3_copilot_cli.sh --verify-only
-./scripts/3_copilot_cli.sh
-./scripts/3_copilot_cli.sh -p "승인된 검증용 질문"
+./scripts/4_copilot_cli.sh --verify-only
+./scripts/4_copilot_cli.sh
+./scripts/4_copilot_cli.sh -p "승인된 검증용 질문"
 ```
 
 다른 구독을 임시로 선택하려면 실제 azd 환경 이름과 구독 ID를 함께 지정하세요.
 아래는 azd 환경이 `dev`이고 생성한 구독이 `dev-04`인 경우의 예시입니다.
 
 ```bash
-AZURE_ENV_NAME=dev APIM_SUBSCRIPTION_ID=dev-04 ./scripts/3_copilot_cli.sh --verify-only
+AZURE_ENV_NAME=dev APIM_SUBSCRIPTION_ID=dev-04 ./scripts/4_copilot_cli.sh --verify-only
 ```
 
 `AZURE_ENV_NAME`을 지정하면 루트 `.env`를 읽지 않으므로, 필요한 `SELF_HOSTED_GATEWAY_*` 등
 선택 설정도 프로세스 환경변수로 함께 전달해야 합니다. 이 명령은 저장된 기본 구독 ID를 변경하지 않습니다.
 
-[3_copilot_cli.sh](scripts/3_copilot_cli.sh)는 `.env` 또는 현재 azd 환경에서
+[4_copilot_cli.sh](scripts/4_copilot_cli.sh)는 `.env` 또는 현재 azd 환경에서
 `AZURE_SUBSCRIPTION_ID`, `APIM_SUBSCRIPTION_ID`, `APIM_NAME`,
 `OPENAI_ACCOUNT_NAME`, `OPENAI_DEPLOYMENT_NAME`을 읽습니다.
 Gateway와 모델 배포 정보를 조회하고 API 연결을 확인합니다.
@@ -306,6 +572,28 @@ Gateway와 모델 배포 정보를 조회하고 API 연결을 확인합니다.
 선택한 활성 APIM 구독의 primary key를 자동 조회해 프로세스 메모리에만 보관합니다.
 키를 파일, azd 환경, 설정 로그 또는 명령 인수에 넣지 않습니다.
 
+CLI가 HTTP `403`을 인증 실패로만 표시하는 경우를 보완하기 위해,
+[copilot-provider.cjs](scripts/copilot-provider.cjs)가 CLI 실행 중에만
+임의 포트의 `127.0.0.1`에서 구독 키로 보호된 로컬 릴레이를 실행합니다.
+릴레이에서 ACA로의 연결은 HTTPS를 유지하며 요청·응답 본문, HTTP 상태 및 스트림을 변경하지 않습니다.
+`PII_DETECTED`이면 터미널에 인증 실패가 아닌 PII 차단임을 알리고 유형·건수·요청 ID를 표시합니다.
+`PII_INSPECTION_UNAVAILABLE`은 검사 장애로 구분합니다.
+원문·탐지값·응답의 임의 메시지는 출력하지 않으며 재시도나 우회 호출도 하지 않습니다.
+CLI 자체의 인증 오류 문구는 추가로 보일 수 있습니다.
+`--verify-only`도 같은 안전한 오류 안내를 표시하지만 로컬 릴레이를 실행하지 않습니다.
+
+이 변경을 기존 환경에 적용하려면 APIM 정책을 포함한 0단계를 다시 실행한 뒤 2단계로
+필터 키를 동기화하고 4단계를 실행하세요. 0단계에서 필터 키가 회전하므로 2단계를 생략하면
+검사 인증 실패로 `503`이 발생할 수 있습니다. PII 컨테이너 코드는 바뀌지 않아 1단계 이미지 재빌드는 필요 없습니다.
+
+```bash
+./scripts/0_azd_up.sh
+unset ACR_NAME ACR_PULL_IDENTITY_ID PII_FILTER_IMAGE
+./scripts/2_create_self_hosted_gateway.sh
+./scripts/4_copilot_cli.sh --verify-only
+./scripts/4_copilot_cli.sh
+```
+
 <details>
 <summary>환경변수</summary>
 
@@ -313,7 +601,7 @@ Gateway와 모델 배포 정보를 조회하고 API 연결을 확인합니다.
 |---|---|
 | `COPILOT_OFFLINE` | `true` |
 | `COPILOT_PROVIDER_TYPE` | `openai` |
-| `COPILOT_PROVIDER_BASE_URL` | `https://<ACA-FQDN>/self-hosted/openai` |
+| `COPILOT_PROVIDER_BASE_URL` | 표시하는 목적지는 `https://<ACA-FQDN>/self-hosted/openai`, 실제 CLI 자식 프로세스는 로컬 릴레이 주소 사용 |
 | `COPILOT_PROVIDER_WIRE_API` | `completions` |
 | `COPILOT_PROVIDER_API_KEY` | APIM subscription primary key, 출력하지 않음 |
 | `COPILOT_PROVIDER_HEADERS` | `Ocp-Apim-Subscription-Key: <동일한 키>`, 출력하지 않음 |
@@ -333,6 +621,8 @@ Gateway와 모델 배포 정보를 조회하고 API 연결을 확인합니다.
 
 ## APIM 정책
 
+아래 기존 정책을 유지하면서 inbound에 필터 호출·판정·차단 단계를 추가했습니다.
+
 [API 정책](apim/policies/openai-policy.xml)은 `self-hosted-openai` API에 배포되며,
 구성을 동기화한 Self-hosted Gateway에서 다음을 수행합니다.
 
@@ -340,6 +630,7 @@ Gateway와 모델 배포 정보를 조회하고 API 연결을 확인합니다.
 |---|---|
 | 호출 경로 제한 | 유효한 구독 키로 관리형 Gateway를 호출해도 정책에서 `403`으로 차단 |
 | 클라이언트 인증 정보 제거 | 모델로 전달하기 전에 APIM 구독 키 헤더·쿼리와 `Authorization` 헤더 제거 |
+| PII 검사·차단 | localhost sidecar로 원본 JSON 검사, 탐지 시 `403`, 검사 실패 시 `503`, 크기·형식 오류는 `400`·`413`·`415` |
 | 모델·요청 변환 | 요청의 `model`을 지정한 배포명으로 고정하고, `max_tokens`를 `max_completion_tokens`로 변환하되 기존 `max_completion_tokens` 값은 유지 |
 | 백엔드 인증 | 비밀 named value `openai-backend-key`의 Azure OpenAI 키를 `api-key` 헤더에 설정해 모델을 직접 호출 |
 | 구독별 토큰 제한 | `llm-token-limit`으로 검증된 구독 ID 기준 분당 토큰 한도와 기간별 토큰 할당량 적용 |
@@ -382,12 +673,12 @@ VM에서 Gateway 컨테이너를 실행해도 APIM 구성 서비스에 대한 �
 29일은 이 샘플의 발급 설정이며, 20~25일은 만료 전 여유를 둔 권장 갱신 간격입니다.
 다른 인증 방식을 사용하면 해당 방식의 자격 증명 관리 절차를 따릅니다.
 
-[1_create_self_hosted_gateway.sh](scripts/1_create_self_hosted_gateway.sh)를 재실행합니다.
+[2_create_self_hosted_gateway.sh](scripts/2_create_self_hosted_gateway.sh)를 재실행합니다.
 새 토큰을 발급해 ACA의 `gateway-token` secret을 교체하고 Gateway 앱을 업데이트·재시작합니다.
 현재 단일 replica 구성에서는 재시작 중 일시적으로 요청이 실패할 수 있으므로 작업 시간을 확보하세요.
 
 ```bash
-./scripts/1_create_self_hosted_gateway.sh
+./scripts/2_create_self_hosted_gateway.sh
 ```
 
 위 스크립트는 ACA용입니다. VM에서는 새 토큰을 컨테이너 설정에 반영해 재생성·재배포해야 하며,
@@ -396,6 +687,22 @@ VM이나 기존 컨테이너를 단순 재시작하는 것만으로 토큰이 �
 이 작업은 Gateway의 Primary key 자체를 재생성하지 않으며, 이전 토큰도 만료 전까지 유효합니다.
 토큰이 노출된 경우에는 APIM의 해당 Gateway에서 토큰 발급에 사용한 Primary key를 먼저 재생성한 뒤
 위 스크립트를 실행하세요. 이 경우 기존 토큰이 무효화되므로 서비스 영향에 주의하세요.
+
+#### PII 필터 키 교체
+
+Bicep의 `piiFilterKey` 기본값은 매 인프라 배포 시 새 UUID로 생성됩니다.
+따라서 `0_azd_up.sh`를 실행하면 APIM의 필터 키가 교체되며, 기존 sidecar는 새 키를 받을 때까지
+인증 실패로 모델 요청을 차단할 수 있습니다. 인프라 재배포 후에는 다음을 실행하세요.
+
+```bash
+./scripts/2_create_self_hosted_gateway.sh
+```
+
+이 스크립트는 APIM의 최신 필터 키를 권한 제한 임시 파일로 조회하고 ACA secret에 반영합니다.
+이미지나 규칙을 바꾸지 않아도 실행할 수 있으며, Gateway 구성 토큰도 함께 갱신합니다.
+무중단 이중 키 전환과 자동 회전은 현재 지원하지 않습니다.
+별도 키를 유지하려면 Bicep의 secure `piiFilterKey` 매개변수를 승인된 비밀 주입 경로로 공급하세요.
+키를 `.env`·소스·명령 인수에 넣지는 마세요.
 
 #### APIM 구독 키 교체
 
@@ -433,14 +740,38 @@ Secondary key를 이용한 무중단 전환은 현재 CLI 스크립트에서 지
 Gateway의 설정 동기화를 기다린 뒤 인증 검증이 성공하면 CLI를 다시 실행하세요.
 
 ```bash
-./scripts/3_copilot_cli.sh --verify-only
-./scripts/3_copilot_cli.sh
+./scripts/4_copilot_cli.sh --verify-only
+./scripts/4_copilot_cli.sh
 ```
 
 검증은 구독 키 인증과 모델 응답을 확인하며 토큰 비용이 발생합니다.
+
+## PII 로컬 테스트
+
+Python 3.13 이상에서 개발 의존성을 별도 가상 환경에 설치합니다.
+런타임 의존성과 개발용 `dev` extra는 [pyproject.toml](pii-filter/pyproject.toml)에서 관리합니다.
+직접 의존성은 확인한 최신 안정 버전에 고정하며, Docker는 개발 의존성 없이 프로젝트를 설치합니다.
+패키지 미러에 고정 버전이 없으면 미러 동기화 또는 공식 PyPI 배포 파일에 대한 정상적인 접근이 필요합니다.
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e './pii-filter[dev]'
+python -m unittest discover -s pii-filter/tests -v
+node --test scripts/tests/self-hosted-gateway.test.cjs scripts/tests/pii-image.test.cjs
+az bicep build --file infra/main.bicep --stdout > /dev/null
+```
+
+Python 테스트는 탐지·허용, 원문 보존, 외부 규칙 변경, 잘못된 JSON·중복 키·형식·인증,
+본문 크기 및 탐지 시간 초과를 검증합니다.
+Node.js 테스트는 Azure 호출을 모의 처리하므로 실제 리소스를 만들거나 이미지를 업로드하지 않습니다.
+Bicep 컴파일과 XML 문법 검사는 실제 APIM 정책 실행·ACA 배포의 대체가 아닙니다.
+실제 Gateway와 echo backend에서 PII 및 검사 장애 요청의 백엔드 호출 0건도 확인해야 합니다.
 
 ## 참고
 
 - [APIM subscriptions](https://github.com/MicrosoftDocs/azure-docs/blob/main/articles/api-management/api-management-subscriptions.md)
 - [Self-hosted gateway ACA 배포](https://github.com/MicrosoftDocs/azure-docs/blob/main/articles/api-management/how-to-deploy-self-hosted-gateway-container-apps.md)
 - [APIM 비밀 named value와 정책 참조](https://learn.microsoft.com/en-us/azure/api-management/api-management-howto-properties)
+- [APIM send-request 정책](https://learn.microsoft.com/en-us/azure/api-management/send-request-policy)
+- [ACA 컨테이너와 sidecar](https://learn.microsoft.com/en-us/azure/container-apps/containers)

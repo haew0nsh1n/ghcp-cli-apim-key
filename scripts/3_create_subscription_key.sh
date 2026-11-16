@@ -2,17 +2,17 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: MIT
 #
-# Usage: ./scripts/2_create_subscription_key.sh [count] [id-prefix] [display-name]
+# Usage: ./scripts/3_create_subscription_key.sh [count] [id-prefix] [display-name]
 #
 # Examples:
-#   ./scripts/2_create_subscription_key.sh
+#   ./scripts/3_create_subscription_key.sh
 #     Creates one subscription: copilot-cli-<UUID>
 #     Display name: Copilot CLI copilot-cli-<UUID>
-#   ./scripts/2_create_subscription_key.sh 3
+#   ./scripts/3_create_subscription_key.sh 3
 #     Creates copilot-cli-<UUID>-1, copilot-cli-<UUID>-2, copilot-cli-<UUID>-3.
-#   ./scripts/2_create_subscription_key.sh 3 dev
+#   ./scripts/3_create_subscription_key.sh 3 dev
 #     Creates dev-1, dev-2, dev-3.
-#   ./scripts/2_create_subscription_key.sh 1 dev-01 "Developer 01"
+#   ./scripts/3_create_subscription_key.sh 1 dev-01 "Developer 01"
 #     Creates dev-01 with display name "Developer 01".
 # Each subscription has its own APIM-generated primary/secondary key pair.
 # Key values are not printed.

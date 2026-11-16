@@ -1,0 +1,6 @@
+*
+!Dockerfile
+!pyproject.toml
+!rules.json
+!app/
+!app/*.py

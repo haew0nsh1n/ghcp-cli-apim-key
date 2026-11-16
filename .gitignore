@@ -32,6 +32,8 @@ __pycache__/
 *.pyo
 venv/
 .venv/
+pii-filter/build/
+pii-filter/*.egg-info/
 
 # Node.js
 node_modules/

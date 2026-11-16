@@ -18,6 +18,8 @@ param tokensPerMinute int
 @minValue(1)
 param tokenQuota int
 param tokenQuotaPeriod string
+@secure()
+param piiFilterKey string
 
 var policyTemplate = loadTextContent('../../apim/policies/openai-policy.xml')
 var policyWithDeployment = replace(policyTemplate, '{{OPENAI_DEPLOYMENT_NAME}}', openAiDeploymentName)
@@ -68,6 +70,16 @@ resource backendKey 'Microsoft.ApiManagement/service/namedValues@2024-05-01' = {
     displayName: 'openai-backend-key'
     secret: true
     value: openAi.listKeys().key1
+  }
+}
+
+resource filterKey 'Microsoft.ApiManagement/service/namedValues@2024-05-01' = {
+  name: 'pii-filter-key'
+  parent: apim
+  properties: {
+    displayName: 'pii-filter-key'
+    secret: true
+    value: piiFilterKey
   }
 }
 
@@ -135,6 +147,7 @@ resource apiPolicy 'Microsoft.ApiManagement/service/apis/policies@2024-05-01' = 
   }
   dependsOn: [
     backendKey
+    filterKey
   ]
 }
 

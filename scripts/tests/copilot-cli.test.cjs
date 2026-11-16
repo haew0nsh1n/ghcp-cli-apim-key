@@ -16,7 +16,7 @@ function run(t, {scenario = {}, args = []} = {}) {
   for (const dir of [bin, copiedScripts]) {
     fs.mkdirSync(dir, {recursive: true});
   }
-  for (const name of ['common.sh', '3_copilot_cli.sh']) {
+  for (const name of ['common.sh', '4_copilot_cli.sh', 'copilot-provider.cjs']) {
     fs.copyFileSync(path.join(scripts, name), path.join(copiedScripts, name));
   }
   fs.writeFileSync(path.join(root, '.env'), [
@@ -52,10 +52,13 @@ if (call.tool === 'copilot') {
     const config = call.config;
     const valid = config.includes(${JSON.stringify(apiKey)});
     fs.writeFileSync(option('--output'), JSON.stringify(
-      scenario.badResponse ? {error: 'unexpected response'} :
+      scenario.piiBlocked && valid ? {error: {
+        code: 'PII_DETECTED', categories: ['EMAIL', 'KOR_PHONE'], matchCount: 2,
+        message: 'synthetic-private-value-must-not-be-printed'
+      }} : scenario.badResponse ? {error: 'unexpected response'} :
         {choices: [{message: {role: 'assistant', content: 'OK'}}], usage: {total_tokens: 3}}
     ));
-    process.stdout.write(scenario.badStatus ? '200' : valid ? '200' : '401');
+    process.stdout.write(scenario.piiBlocked && valid ? '403' : scenario.badStatus ? '200' : valid ? '200' : '401');
   }
 } else if (args[0] === 'apim') {
   console.log(scenario.missingApim ? '' : ${JSON.stringify(apimId)});
@@ -103,7 +106,7 @@ if (call.tool === 'copilot') {
   for (const name of ['az', 'copilot', 'curl']) {
     fs.writeFileSync(path.join(bin, name), mock, {mode: 0o700});
   }
-  const script = path.join(copiedScripts, '3_copilot_cli.sh');
+  const script = path.join(copiedScripts, '4_copilot_cli.sh');
   const result = spawnSync('/bin/bash', [script, ...args], {
     cwd: root,
     env: {
@@ -142,7 +145,7 @@ test('resolves actual resources, logs the same provider fields, and launches off
   const cli = invocation(result);
   assert.deepEqual(cli.args, ['-p', 'prompt with spaces', '--stream', 'off']);
   assert.equal(cli.env.COPILOT_OFFLINE, 'true');
-  assert.equal(cli.env.COPILOT_PROVIDER_BASE_URL, 'https://gateway.example.invalid/self-hosted/openai');
+  assert.match(cli.env.COPILOT_PROVIDER_BASE_URL, /^http:\/\/127\.0\.0\.1:\d+\/self-hosted\/openai$/);
   assert.equal(cli.env.COPILOT_PROVIDER_TYPE, 'openai');
   assert.equal(cli.env.COPILOT_PROVIDER_WIRE_API, 'completions');
   assert.equal(cli.env.COPILOT_MODEL, 'actual-deployed-model');
@@ -246,5 +249,14 @@ test('verification fails explicitly on incorrect status or malformed completion'
     assert.match(result.stderr, /API key check failed/);
     assert.match(result.stdout, /API_KEY_VERIFY_EXIT_CODE\s+= 1/);
   }
+});
+
+test('verification identifies PII blocking without printing response text or treating it as success', t => {
+  const result = run(t, {args: ['--verify-only'], scenario: {piiBlocked: true}});
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /PII_DETECTED.*not an API key authentication failure/);
+  assert.match(result.stderr, /categories=EMAIL,KOR_PHONE; matchCount=2/);
+  assert.ok(!result.stderr.includes('synthetic-private-value-must-not-be-printed'));
+  assert.equal(invocation(result), undefined);
 });
 
