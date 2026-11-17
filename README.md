@@ -369,6 +369,141 @@ Gateway 컨테이너는 ACA에서 실행하므로 로컬 Docker CLI는 필요하
 > CLI 실행에는 Gateway뿐 아니라 Azure 관리 API 접근도 필요합니다.
 > 이 저장소의 설정만으로 망분리 준수 또는 외부 통신 차단을 보장하지 않습니다.
 
+### 방화벽 허용 목록
+
+현재 `feature/pii-filter` 브랜치의 공개 엔드포인트 기반 ACA 배포를 기준으로 합니다.
+Source는 연결을 시작하는 주체이며, Port는 Target의 목적지 포트입니다.
+`<...>`는 실제 배포값으로 바꾸세요. 아래 목록은 방화벽을 자동으로 구성하지 않습니다.
+
+모델 요청 경로는 `사용자 → Self-hosted Gateway → PII 검사 → Gateway → Azure OpenAI`입니다.
+APIM은 모델 요청을 중계하지 않으며, Gateway가 APIM 구성 서비스에 접속해 정책과 구독 정보를 동기화합니다.
+main과 비교하면 같은 ACA replica 내 PII 검사 통신과 PII 이미지 빌드·다운로드 경로가 추가됩니다.
+
+#### 모델 호출 및 Gateway 운영
+
+| Source                         | Target                                                            | Port       | 용도 및 적용 조건                                           |
+|--------------------------------|-------------------------------------------------------------------|------------|------------------------------------------------------------|
+| 사용자 PC / Copilot CLI         | ACA Gateway FQDN `<app>.<환경 도메인>.azurecontainerapps.io`        | TCP 443    | 모델 요청, Gateway 상태 확인                                |
+| Self-hosted Gateway            | `<APIM명>.configuration.azure-api.net`                             | TCP 443    | API·정책·구독 동기화 및 상태 보고                            |
+| Self-hosted Gateway            | APIM 인스턴스 주 지역의 공인 IP                                    | TCP 443    | Microsoft 문서상 필수 대상, 구성 FQDN과 IP가 같으면 중복 제거 |
+| Self-hosted Gateway            | PII sidecar `127.0.0.1`                                           | TCP 8000   | 동일 replica 내 HTTP 검사 요청, 외부 방화벽 개방 불필요       |
+| ACA 플랫폼 health probe        | PII sidecar의 `/healthz`                                          | TCP 8000   | startup·readiness·liveness 확인, 외부 사용자 접근용 아님      |
+| Self-hosted Gateway            | `<OpenAI계정명>.openai.azure.com`                                  | TCP 443    | PII 검사 통과 시에만 Azure OpenAI 모델 호출                  |
+| 사용자 PC 및 Gateway 실행 환경 | 조직 또는 실행 플랫폼에서 지정한 DNS 서버                         | UDP/TCP 53 | 대상 FQDN 이름 해석                                         |
+
+PII 필터는 로컬 규칙으로 검사하므로 외부 PII 분석 서비스나 별도 모델 API에 접속하지 않습니다.
+필터는 probe 접근을 위해 `0.0.0.0:8000`으로 수신하지만 외부 ingress에는 연결하지 않습니다.
+외부 방화벽 개방이 불필요하다는 의미이지 loopback에만 바인딩되거나 네트워크 격리가 보장된다는 뜻은 아닙니다.
+검사 API의 필터 전용 키 인증을 유지하세요.
+
+#### 모니터링 및 조건부 통신
+
+| Source              | Target                                                                                  | Port    | 용도 및 적용 조건                                                        |
+|---------------------|-----------------------------------------------------------------------------------------|---------|-------------------------------------------------------------------------|
+| Self-hosted Gateway | Application Insights 연결 문자열의 `IngestionEndpoint` 호스트                            | TCP 443 | 요청·오류·PII 판정 메타데이터·토큰 사용량 전송                             |
+| Self-hosted Gateway | `dc.services.visualstudio.com`, `rt.services.visualstudio.com`                            | TCP 443 | Microsoft가 안내하는 Application Insights 통합 대상, 실제 수집 설정 확인 |
+| Self-hosted Gateway | `<region>.livediagnostics.monitor.azure.com`                                             | TCP 443 | Application Insights Live Metrics 사용 시                               |
+| Self-hosted Gateway | APIM에 연결된 `<스토리지계정명>.blob.core.windows.net`, `<스토리지계정명>.table.core.windows.net` | TCP 443 | v2에서 API inspector 또는 quota 정책 사용 시 조건부 필요                 |
+
+Application Insights는 실제 연결 문자열과
+[Azure Monitor 네트워크 요구사항](https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/azure-monitor-network-access)을 확인해
+사용 중인 수집 기능의 대상만 허용하세요.
+조건부 Storage 대상은 임의의 계정이 아니라 Azure Portal의 APIM 네트워크 연결 상태에 표시된 연결 계정입니다.
+현재 정책의 `llm-token-limit`과 별도로, 추가하는 quota 정책의 Storage 의존성을 확인하세요.
+PII 원문이나 실제 탐지값은 로그로 전송하지 않습니다.
+
+#### 현재 실행 스크립트 및 배포·관리
+
+| Source                       | Target                                                         | Port    | 용도 및 적용 조건                                         |
+|------------------------------|----------------------------------------------------------------|---------|----------------------------------------------------------|
+| 사용자 PC / 배포·관리 PC      | `management.azure.com`                                         | TCP 443 | 실행 전 리소스·APIM 구독 키 조회, 리소스 배포·관리          |
+| 사용자 PC / 배포·관리 PC      | `login.microsoftonline.com` 및 테넌트 로그인에 필요한 엔드포인트 | TCP 443 | Azure 로그인·토큰 갱신, 인증 방식별 추가 대상 확인          |
+| Gateway 컨테이너 실행 플랫폼 | `mcr.microsoft.com`, `*.data.mcr.microsoft.com`                  | TCP 443 | 공식 Gateway 이미지 다운로드·갱신                        |
+| ACA 실행 플랫폼              | `<ACR명>.azurecr.io` 및 ACR이 반환하는 이미지 다운로드 엔드포인트 | TCP 443 | PII 필터 이미지 pull, 사용자 할당 identity의 `AcrPull` 사용 |
+| 이미지 빌드·배포 PC           | ACR 및 빌드 컨텍스트 업로드·로그 조회에 사용되는 Storage 대상    | TCP 443 | `az acr build` 제출·결과 조회 및 이미지 digest 조회         |
+| ACR Build 실행 환경          | Docker Hub 및 이미지 레이어 다운로드 대상                      | TCP 443 | PII Dockerfile의 `python:3.13-slim-bookworm` 베이스 pull    |
+| ACR Build 실행 환경          | `pypi.org`, `files.pythonhosted.org`                            | TCP 443 | Python 패키지·빌드 의존성 설치, 사내 미러 사용 시 대상 변경 |
+| ACR Build 실행 환경          | 대상 ACR 및 이미지 데이터 엔드포인트                            | TCP 443 | 빌드한 PII 이미지 push                                   |
+
+ACR 이미지 다운로드 대상은 레지스트리 설정에 따라 전용 데이터 FQDN 또는 Storage 대상이 될 수 있습니다.
+실제 반환되는 대상과 네트워크 요구사항을 확인하고, 공유 Storage 도메인 전체를 무조건 허용하지 마세요.
+[이미지 빌드 스크립트](scripts/1_build_pii_image.sh)는 로컬 Docker가 아니라 원격 ACR Build를 사용하므로,
+배포 PC와 빌드 실행 환경의 허용 경로를 구분해야 합니다.
+[CLI 실행 스크립트](scripts/4_copilot_cli.sh)는 시작할 때 Azure 관리 API에서 리소스 정보와 구독 키를 조회합니다.
+일반 사용자에게 이 통신과 관리 권한을 허용하지 않으려면, 승인된 설정·키 배포 방식을 별도로 구현해야 합니다.
+
+- 외부 클라이언트는 TCP 443만 사용하며, ACA가 컨테이너 내부 TCP 8080으로 전달하므로 8080과 PII용 8000을 외부에 개방하지 않습니다.
+- Gateway가 설정 동기화를 시작하므로 APIM에서 Gateway로 새 연결을 시작하는 인바운드 규칙은 필요하지 않습니다.
+- 상태 기반 방화벽에서는 허용한 연결의 응답 트래픽을 반환 경로로 처리합니다.
+- FQDN과 실제 해석되는 IP가 모두 접근 가능해야 합니다. IP 기반 규칙은 주소 변경을 추적해야 합니다.
+- Private Endpoint나 사설 Gateway를 도입하면 대상 주소·라우팅·Private DNS를 해당 구성에 맞게 변경해야 합니다.
+- ACA 플랫폼 자체의 전체 네트워크 의존성, 도구 설치·업데이트, 플러그인·MCP 및 실행 명령의 추가 통신은 별도 검토 대상입니다.
+
+Gateway 필수·조건부 대상은
+[Microsoft Self-hosted Gateway 연결 요구사항](https://learn.microsoft.com/en-us/azure/api-management/self-hosted-gateway-overview#fqdn-dependencies)을 참고하세요.
+
+### Private Network 적용 시 추가 고려사항
+
+> [!IMPORTANT]
+> 현재 저장소는 Private Network 구성을 구현하거나 검증하지 않았습니다.
+> 아래 내용은 별도 설계·구현 시 검토할 항목이며, 앞의 공개 엔드포인트 방화벽 목록을 그대로 적용하거나
+> `publicNetworkAccess`만 비활성화해서는 사설 통신이 구성되지 않습니다.
+
+사용자 진입 경로, Gateway의 모델 호출, APIM 설정 동기화, 모니터링 및 배포·관리를 각각 구분해 설계하세요.
+모델 요청을 사설화해도 다른 경로까지 자동으로 사설화되지는 않습니다.
+PII sidecar는 main과 다른 내부 검사 단계일 뿐 사설망 연결을 제공하거나 Gateway 우회를 차단하지 않습니다.
+
+| 검토 영역                  | Private Network에서 별도로 구성할 사항                                                                                                                              |
+|----------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 기업망과 Azure 연결        | VPN 또는 ExpressRoute, VNet 피어링, 주소 대역 중복 방지, 왕복 라우팅을 구성합니다. Gateway·Private Endpoint 사설 IP까지 실제 접근 가능한지 확인합니다.                 |
+| Gateway 배포 환경          | ACA에 사용자 VNet과 전용 서브넷을 구성하고, 내부 환경 또는 지원되는 환경 Private Endpoint 방식을 선택합니다. 기본 네트워크 환경에서 전환하려면 환경 재생성이 필요할 수 있습니다. |
+| ACA ingress 범위           | 환경의 사설 진입 경로와 앱 ingress 범위를 함께 설계합니다. 앱의 `external: false`는 같은 ACA 환경 내부로 접근을 제한하므로 기업망 사용자용 사설 진입 설정과 같지 않습니다. |
+| Azure OpenAI               | Private Endpoint와 Private DNS를 구성하고 Gateway VNet에서 접근을 검증한 뒤 공개 접근을 차단합니다. 기존 모델 FQDN을 유지하고 DNS가 사설 IP를 반환하게 합니다.           |
+| APIM 구성 서비스           | Gateway에서 v2 구성 엔드포인트로 사설 연결이 필요합니다. 현재 지원 SKU인 classic Developer/Premium의 내부 VNet 주입과 구성 엔드포인트 DNS·라우팅을 검토합니다.             |
+| APIM Private Endpoint 범위 | APIM의 일반적인 inbound Private Endpoint만으로 Self-hosted Gateway 구성 엔드포인트나 Azure 관리 API까지 사설화된다고 가정하지 마세요. 지원 대상과 SKU 제약을 확인합니다. |
+| DNS                        | Private DNS Zone의 VNet 연결과 온프레미스 조건부 전달을 구성합니다. 필요하면 Azure DNS Private Resolver를 사용하고, 사용자 PC와 Gateway 양쪽의 이름 해석을 검증합니다.     |
+| 방화벽 및 아웃바운드       | NSG, UDR, Azure Firewall 또는 프록시 정책을 함께 설계합니다. ACA 플랫폼 필수 통신과 APIM 자체의 VNet 의존성은 애플리케이션 통신과 별도로 허용해야 합니다.                   |
+| 로그·메트릭                | Azure Monitor Private Link Scope(AMPLS), 모니터링 리소스 연결 및 Private DNS를 검토합니다. 사용 중인 수집·조회·Live Metrics 기능의 사설 연결 지원 여부를 확인합니다.        |
+| PII sidecar                | 같은 replica의 HTTP 검사 경로와 probe를 유지하고 8000을 외부 ingress에 연결하지 않습니다. 네트워크 변경 후에도 필터 키 인증과 검사 실패 시 fail-closed를 검증합니다.        |
+| ACR SKU 및 사설 연결       | 현재 ACR은 Basic·공개 접근입니다. Private Endpoint를 사용하려면 Premium SKU로 변경하고 레지스트리·데이터 엔드포인트의 Private DNS와 접근 경로를 구성해야 합니다.              |
+| 이미지 및 의존성 공급      | 공식 Gateway와 Python 베이스 이미지를 승인된 사설 레지스트리로 반입하고 Python 패키지 미러를 검토합니다. 현재 Gateway 이미지 설정과 PII Dockerfile·빌드 설정을 함께 수정합니다. |
+| 사설 ACR 빌드              | 기본 `az acr build`가 사설 ACR에 자동 접근한다고 가정하지 마세요. 지원 지역·SKU를 확인한 VNet 연결 ACR Tasks agent pool 또는 사설망 빌드 실행기를 별도 구성합니다.            |
+| 배포·관리 실행 위치        | 사설 Gateway·ACR에 접근하는 스크립트와 CI 실행기를 해당 네트워크에 배치합니다. Azure 관리 API·Entra 인증 통신은 별도 승인하고 사용자 실행 시 구독 키 조회 방식을 재검토합니다. |
+| TLS 및 자격 증명           | 사설망에서도 HTTPS, 인증서 호스트 이름 검증, APIM 구독 키·Gateway 연결 토큰·PII 필터 키의 보호·갱신을 유지합니다. 사내 CA 사용 시 클라이언트·컨테이너 신뢰 저장소를 구성합니다. |
+
+#### 사설 통신 경로의 방화벽 검토 예시
+
+아래는 사설 연결을 별도로 구현한 뒤의 논리적 허용 경로입니다.
+환경별 실제 사설 IP·서브넷과 정책으로 구체화해야 하며, 플랫폼·관리 통신을 포함한 전체 허용 목록은 아닙니다.
+기존 공개 IP 규칙은 사설 전환 검증 후 필요한 항목만 대체하거나 제거하세요.
+
+| Source                         | Target                                                        | Port       | 전제 조건                                          |
+|--------------------------------|---------------------------------------------------------------|------------|---------------------------------------------------|
+| 기업망 사용자 PC               | Gateway의 사설 진입 IP 또는 내부 프록시 IP                     | TCP 443    | VPN/ExpressRoute 등 사설 경로와 Gateway FQDN 해석   |
+| Self-hosted Gateway            | APIM v2 구성 엔드포인트의 사설 IP                              | TCP 443    | 내부 VNet 구성 및 구성 FQDN의 사설 DNS·라우팅       |
+| Self-hosted Gateway            | PII sidecar `127.0.0.1`                                        | TCP 8000   | 기존 replica 내부 HTTP 통신 유지, 외부 개방 불필요 |
+| Self-hosted Gateway            | Azure OpenAI Private Endpoint IP                              | TCP 443    | 모델 FQDN이 해당 사설 IP로 해석                     |
+| Self-hosted Gateway            | AMPLS를 통해 연결한 모니터링 수집 엔드포인트의 사설 IP          | TCP 443    | 해당 수집 기능의 Private Link 지원 및 DNS 구성     |
+| ACA 실행 플랫폼 및 빌드 실행기 | ACR 레지스트리·데이터 엔드포인트의 사설 IP                     | TCP 443    | Premium·Private Endpoint·DNS 및 이미지 pull/push 권한 |
+| 사용자 PC 및 Gateway 실행 환경 | 각 네트워크에서 지정한 DNS 서버·Resolver                       | UDP/TCP 53 | 온프레미스와 Azure 간 DNS 전달 경로 구성            |
+
+현재 [Gateway 배포 스크립트](scripts/2_create_self_hosted_gateway.sh)는 공개 ingress를 설정하고,
+[CLI 실행 스크립트](scripts/4_copilot_cli.sh)는 기본 APIM 구성 FQDN과 Azure 관리 API 조회를 전제로 합니다.
+[ACR 모듈](infra/modules/registry.bicep)은 Basic SKU와 공개 접근을 설정하며,
+[이미지 빌드 스크립트](scripts/1_build_pii_image.sh)는 사설 빌드용 agent pool을 지정하지 않습니다.
+사설 배포에 맞게 스크립트와 인프라를 함께 수정해야 하며, 기존 배포 재실행으로 공개 설정이 복원되지 않도록 해야 합니다.
+
+전환 후에는 사용자 PC와 Gateway 각각에서 DNS 결과, TCP 443 연결 및 TLS 인증서를 확인하세요.
+실제 모델 호출뿐 아니라 Gateway 재시작 후 초기 구성 다운로드, 정책·구독 변경 반영, 로그 수집과 이미지 재배포도 검증해야 합니다.
+합성 데이터로 PII 허용·차단, 필터 장애 시 모델 호출 차단, 두 컨테이너의 readiness 및 필터 키 교체도 검증하세요.
+외부 네트워크에서 사설화한 서비스와 PII 포트에 접근할 수 없는지도 확인하세요.
+
+관련 제약과 구성 절차는 [ACA 네트워킹](https://learn.microsoft.com/en-us/azure/container-apps/networking),
+[APIM Private Endpoint](https://learn.microsoft.com/en-us/azure/api-management/private-endpoint),
+[APIM 내부 VNet의 구성 서비스 연결](https://learn.microsoft.com/en-us/azure/api-management/self-hosted-gateway-overview#connectivity-in-an-internal-virtual-network),
+[ACR Private Endpoint](https://learn.microsoft.com/en-us/azure/container-registry/container-registry-private-endpoints),
+[ACR Tasks agent pool](https://learn.microsoft.com/en-us/azure/container-registry/tasks-agent-pools)을 참고하세요.
+
 ## 배포 및 실행 순서
 
 > [!NOTE]
