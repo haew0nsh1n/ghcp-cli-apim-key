@@ -66,7 +66,7 @@ flowchart LR
 |---|---|
 | 리소스 배포·조회 및 구독 키 조회 | Azure CLI의 `az login`, Azure Developer CLI의 `azd auth login` 세션과 Azure 관리 권한 |
 | Copilot CLI → Self-hosted Gateway | `Ocp-Apim-Subscription-Key` 헤더의 APIM 구독 키 |
-| Self-hosted Gateway → Azure OpenAI | APIM의 비밀 named value `openai-backend-key`에 저장한 Azure OpenAI API 키를 `api-key` 헤더로 전달 |
+| Self-hosted Gateway → Azure OpenAI | APIM의 Key Vault 참조 named value `openai-backend-key`에서 해석한 Azure OpenAI API 키를 `api-key` 헤더로 전달 |
 | Gateway → APIM 구성 서비스 | ACA의 `gateway-token` secret에 보관한 별도의 Gateway 연결 토큰으로 구성·정책 동기화 |
 
 Gateway는 API의 `subscriptionRequired: true` 설정에 따라 APIM 기본 구독 키 검증을 수행합니다.
@@ -84,6 +84,7 @@ Azure 리소스 관리 로그인은 모델 API 호출 인증과 별개입니다.
 - 리소스 그룹, APIM, Azure OpenAI 및 모니터링 리소스를 생성할 권한
 - APIM/ACA/모델 조회 및 APIM `subscriptions/read`, `subscriptions/listSecrets/action` 권한
 - Bicep 배포 주체의 Azure OpenAI `accounts/listKeys/action` 권한
+- Bicep 배포 주체의 Key Vault 및 secret 생성 권한과 Vault 범위의 `Key Vault Secrets User` 역할 할당 권한
 - Workbook 조회를 위한 대상 Log Analytics 로그 데이터 조회 권한
 
 CLI 실행 계정에도 위의 리소스 조회·구독 키 읽기 권한이 필요합니다.
@@ -164,6 +165,11 @@ APIM은 모델 요청을 중계하지 않으며, Gateway가 APIM 구성 서비�
 | Self-hosted Gateway            | APIM 인스턴스 주 지역의 공인 IP                                    | TCP 443    | Microsoft 문서상 필수 대상, 구성 FQDN과 IP가 같으면 중복 제거 |
 | Self-hosted Gateway            | `<OpenAI계정명>.openai.azure.com`                                  | TCP 443    | Azure OpenAI 모델 호출                                      |
 | 사용자 PC 및 Gateway 실행 환경 | 조직 또는 실행 플랫폼에서 지정한 DNS 서버                         | UDP/TCP 53 | 대상 FQDN 이름 해석                                         |
+
+APIM 관리 영역은 시스템 할당 관리 ID와
+[신뢰할 수 있는 Microsoft 서비스 예외](https://learn.microsoft.com/en-us/azure/api-management/api-management-howto-properties#requirements-for-key-vault-firewall)를
+사용해 기본 거부로 구성된 Key Vault에서 키를 읽습니다. Copilot CLI와 ACA는 Vault에 직접 연결하지 않으므로
+Vault 접속용 방화벽 규칙을 추가할 필요가 없습니다.
 
 #### 모니터링 및 조건부 통신
 
@@ -281,9 +287,14 @@ azd env new dev  # 최초 한 번만 실행합니다.
 
 - 작업 영역 기반 Application Insights, Log Analytics, 사용량 Workbook 및 APIM 서비스의 GatewayLogs 진단 설정
 - API 키 인증을 활성화한 Azure OpenAI 계정 및 모델 배포
-- APIM 서비스 및 비밀 named value `openai-backend-key`(Azure OpenAI primary key 저장)
+- Azure OpenAI KEY 1을 저장하는 전용 Key Vault와 APIM 관리 ID의 `Key Vault Secrets User` 역할
+- Key Vault secret을 버전 없이 참조하는 APIM named value `openai-backend-key`
 - 구독 필수 `self-hosted-openai` API와 `POST /self-hosted/openai/chat/completions` 통합 정책
 - 구독 필수 Product `copilot-cli`(API를 묶는 단위)와 API 연결
+
+`main`은 별도 Azure 환경 또는 리소스 그룹에 배포하세요. PII 필터 브랜치가 사용 중인 APIM에
+배포하면 기존 PII 검사 정책을 덮어씁니다. 최초 배포에서 역할 할당 직후 Vault 접근이 거절되면
+권한 전파를 기다린 뒤 다시 배포하세요.
 
 Bicep은 클라이언트용 subscription이나 키를 생성하지 않습니다.
 `APIM_SUBSCRIPTION_ID`는 CLI에서 사용할 APIM 구독 식별자이며,
@@ -524,14 +535,15 @@ Secondary key를 이용한 무중단 전환은 현재 CLI 스크립트에서 지
 
 #### Azure OpenAI 백엔드 키 교체
 
-현재 Bicep은 Azure OpenAI의 KEY 1을 APIM의 비밀 named value `openai-backend-key`에 저장합니다.
+현재 Bicep은 Azure OpenAI의 KEY 1을 Key Vault에 저장하고, APIM의 `openai-backend-key`는 이 secret을 참조합니다.
 자동으로 KEY 2로 전환하는 기능은 없으므로, 현재 스크립트 기준으로는 작업 시간을 확보하고 교체합니다.
 
 1. 해당 KEY 1의 모든 사용처와 영향을 확인하고 모델 요청을 중단합니다.
 2. Azure Portal에서 Azure OpenAI 리소스의 KEY 1을 재생성합니다. 이전 KEY 1은 사용할 수 없게 됩니다.
-3. `./scripts/0_azd_up.sh`를 실행합니다. Bicep이 새 KEY 1을 조회해 named value에 반영합니다.
+3. `./scripts/0_azd_up.sh`를 실행합니다. Bicep이 새 KEY 1을 조회해 Key Vault에 저장합니다.
    이 명령은 전체 Bicep 인프라를 재배포하므로 다른 구성에 미치는 영향도 확인하세요.
-4. Gateway 설정 동기화와 아래 공통 검증을 완료한 뒤 모델 요청을 재개합니다.
+4. APIM의 Key Vault 참조를 새로 고침하거나 자동 갱신(최대 4시간)을 기다립니다.
+   Gateway 설정 동기화와 아래 공통 검증을 완료한 뒤 모델 요청을 재개합니다.
 
 ![Azure OpenAI의 API 키 인증 설정과 KEY 1 재생성 메뉴](images/6.png)
 
