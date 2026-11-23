@@ -1,0 +1,18 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "app": { "type": "secureObject" },
+    "piiFilterKey": { "type": "secureString", "minLength": 32, "maxLength": 4096 }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2024-03-01",
+      "name": "[parameters('app').name]",
+      "location": "[parameters('app').location]",
+      "identity": "[parameters('app').identity]",
+      "properties": "[union(parameters('app').properties, createObject('configuration', createObject('secrets', concat(parameters('app').properties.configuration.secrets, array(createObject('name', 'pii-filter-key', 'value', parameters('piiFilterKey')))))))]"
+    }
+  ]
+}

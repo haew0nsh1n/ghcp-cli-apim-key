@@ -9,7 +9,9 @@ param publisherName string
 ])
 param skuName string
 param openAiEndpoint string
-param openAiAccountName string
+param vaultName string
+param openAiSecretUri string
+param piiSecretUri string
 param openAiDeploymentName string
 param appInsightsId string
 param appInsightsConnectionString string
@@ -18,8 +20,6 @@ param tokensPerMinute int
 @minValue(1)
 param tokenQuota int
 param tokenQuotaPeriod string
-@secure()
-param piiFilterKey string
 
 var policyTemplate = loadTextContent('../../apim/policies/openai-policy.xml')
 var policyWithDeployment = replace(policyTemplate, '{{OPENAI_DEPLOYMENT_NAME}}', openAiDeploymentName)
@@ -27,8 +27,18 @@ var policyWithRate = replace(policyWithDeployment, '{{TOKENS_PER_MINUTE}}', stri
 var policyWithQuota = replace(policyWithRate, '{{TOKEN_QUOTA}}', string(tokenQuota))
 var policyXml = replace(policyWithQuota, '{{TOKEN_QUOTA_PERIOD}}', tokenQuotaPeriod)
 
-resource openAi 'Microsoft.CognitiveServices/accounts@2024-10-01' existing = {
-  name: openAiAccountName
+resource vault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
+  name: vaultName
+}
+
+resource vaultRead 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: vault
+  name: guid(vault.id, apim.id, 'Key Vault Secrets User')
+  properties: {
+    principalId: apim.identity.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
+  }
 }
 
 resource apim 'Microsoft.ApiManagement/service@2024-05-01' = {
@@ -69,8 +79,11 @@ resource backendKey 'Microsoft.ApiManagement/service/namedValues@2024-05-01' = {
   properties: {
     displayName: 'openai-backend-key'
     secret: true
-    value: openAi.listKeys().key1
+    keyVault: {
+      secretIdentifier: openAiSecretUri
+    }
   }
+  dependsOn: [vaultRead]
 }
 
 resource filterKey 'Microsoft.ApiManagement/service/namedValues@2024-05-01' = {
@@ -79,8 +92,11 @@ resource filterKey 'Microsoft.ApiManagement/service/namedValues@2024-05-01' = {
   properties: {
     displayName: 'pii-filter-key'
     secret: true
-    value: piiFilterKey
+    keyVault: {
+      secretIdentifier: piiSecretUri
+    }
   }
+  dependsOn: [vaultRead]
 }
 
 resource api 'Microsoft.ApiManagement/service/apis@2024-05-01' = {

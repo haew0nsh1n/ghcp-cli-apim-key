@@ -40,9 +40,9 @@ param tokenQuota string = '1000000'
 param tokenQuotaPeriod string = 'Monthly'
 
 @secure()
-@minLength(32)
-@description('PII sidecar authentication key. The default rotates on each infrastructure deployment; redeploy the gateway afterward.')
-param piiFilterKey string = newGuid()
+@maxLength(4096)
+@description('Supply the current PII sidecar key for migration, or a new key for initial deployment or scheduled rotation. Empty reuses the existing Vault secret.')
+param piiFilterKey string = ''
 
 var uniqueSuffix = uniqueString(subscription().id, resourceGroup().id, resourcePrefix)
 var apimName = '${resourcePrefix}-apim-${uniqueSuffix}'
@@ -50,6 +50,7 @@ var openAiName = take('${resourcePrefix}-aoai-${uniqueSuffix}', 64)
 var workspaceName = '${resourcePrefix}-law-${uniqueSuffix}'
 var appInsightsName = '${resourcePrefix}-appi-${uniqueSuffix}'
 var acrName = '${replace(resourcePrefix, '-', '')}acr${uniqueSuffix}'
+var vaultName = 'kv-${uniqueSuffix}'
 
 module registry 'modules/registry.bicep' = {
   name: 'registry'
@@ -82,6 +83,16 @@ module openai 'modules/openai.bicep' = {
   }
 }
 
+module vault 'modules/key-vault.bicep' = {
+  name: 'key-vault'
+  params: {
+    location: location
+    vaultName: vaultName
+    openAiAccountName: openai.outputs.accountName
+    piiFilterKey: piiFilterKey
+  }
+}
+
 module apim 'modules/apim.bicep' = {
   name: 'apim'
   params: {
@@ -91,14 +102,15 @@ module apim 'modules/apim.bicep' = {
     publisherName: apimPublisherName
     skuName: apimSkuName
     openAiEndpoint: openai.outputs.endpoint
-    openAiAccountName: openai.outputs.accountName
+    vaultName: vault.outputs.name
+    openAiSecretUri: vault.outputs.openAiSecretUri
+    piiSecretUri: vault.outputs.piiSecretUri
     openAiDeploymentName: openAiDeploymentName
     appInsightsId: monitoring.outputs.appInsightsId
     appInsightsConnectionString: monitoring.outputs.appInsightsConnectionString
     tokensPerMinute: int(tokensPerMinute)
     tokenQuota: int(tokenQuota)
     tokenQuotaPeriod: tokenQuotaPeriod
-    piiFilterKey: piiFilterKey
   }
 }
 
@@ -117,6 +129,7 @@ output APIM_GATEWAY_URL string = apim.outputs.gatewayUrl
 output APIM_SUBSCRIPTION_ID string = apimSubscriptionId
 output OPENAI_ACCOUNT_NAME string = openAiName
 output OPENAI_DEPLOYMENT_NAME string = openAiDeploymentName
+output KEY_VAULT_NAME string = vaultName
 output APPLICATION_INSIGHTS_NAME string = appInsightsName
 output LOG_ANALYTICS_WORKSPACE_NAME string = workspaceName
 output APIM_USER_USAGE_WORKBOOK_NAME string = workbook.outputs.workbookName

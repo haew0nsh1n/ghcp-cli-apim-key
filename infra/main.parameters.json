@@ -43,6 +43,9 @@
     },
     "tokenQuotaPeriod": {
       "value": "${TOKEN_QUOTA_PERIOD=Monthly}"
+    },
+    "piiFilterKey": {
+      "value": "${PII_FILTER_KEY=}"
     }
   }
 }

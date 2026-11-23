@@ -3,6 +3,7 @@
 .azure/
 .self-hosted-gateway.*/
 .api-key-check.*/
+apim-advisory-report.json
 
 # OS generated files
 .DS_Store

@@ -7,7 +7,8 @@ const {test} = require('node:test');
 const scripts = path.resolve(__dirname, '..');
 const apimId = '/subscriptions/test-sub/resourceGroups/actual-rg/providers/Microsoft.ApiManagement/service/test-apim';
 const fakeToken = 'test-gateway-token-not-a-real-credential';
-const fakeFilterKey = 'test-pii-filter-key-not-a-real-credential';
+const secretVersion = '0123456789abcdef0123456789abcdef';
+const secretUri = `https://kv-test.vault.azure.net/secrets/pii-filter-key/${secretVersion}`;
 const pullIdentity = '/subscriptions/test-sub/resourceGroups/actual-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/pii-pull';
 const piiImage = `testacr.azurecr.io/pii-filter@sha256:${'a'.repeat(64)}`;
 
@@ -18,7 +19,7 @@ function run(t, scenario = {}) {
   const copy = path.join(root, 'scripts');
   fs.mkdirSync(bin);
   fs.mkdirSync(copy);
-  for (const name of ['common.sh', '2_create_self_hosted_gateway.sh']) {
+  for (const name of ['common.sh', '2_create_self_hosted_gateway.sh', 'container-app.template.json']) {
     fs.copyFileSync(path.join(scripts, name), path.join(copy, name));
   }
   fs.mkdirSync(path.join(root, 'pii-filter'));
@@ -42,6 +43,15 @@ for (const key of ['--body']) {
     call[key] = JSON.parse(fs.readFileSync(file, 'utf8'));
     call.mode = fs.statSync(file).mode & 0o777;
   }
+  if (args.slice(0, 3).join(' ') === 'deployment group create') {
+    const file = option('--parameters').slice(1);
+    call.parameters = JSON.parse(fs.readFileSync(file, 'utf8')).parameters;
+    call.mode = fs.statSync(file).mode & 0o777;
+    if (scenario.deploymentFailure) {
+      console.error('Container App deployment request failed.');
+      process.exit(17);
+    }
+  }
 }
 fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(call) + '\\n');
 if (call.tool === 'curl') {
@@ -53,8 +63,8 @@ if (call.tool === 'curl') {
   } else {
     const deployment = fs.readFileSync(${JSON.stringify(log)}, 'utf8')
       .trim().split('\\n').map(line => JSON.parse(line))
-      .find(item => item['--body']?.type === 'Microsoft.App/containerApps');
-    const readiness = deployment['--body'].properties.template.containers[0].probes
+      .find(item => item.parameters?.app);
+    const readiness = deployment.parameters.app.value.properties.template.containers[0].probes
       .find(probe => probe.type === 'Readiness');
     if (scenario.healthTimeout || readiness.httpGet.path !== '/status-0123456789abcdef' ||
         readiness.httpGet.port !== 8080) {
@@ -76,12 +86,6 @@ if (call.tool === 'curl') {
       query === 'location' ? 'eastus2' : 'https://test-apim.azure-api.net');
   }
 } else if (args[0] === 'rest') {
-  if (option('--method') === 'PUT' &&
-      option('--uri').includes('/providers/Microsoft.App/containerApps/') &&
-      scenario.deploymentFailure) {
-    console.error('Container App deployment request failed.');
-    process.exit(17);
-  }
   if (scenario.missingBackendKey && option('--method') === 'GET' &&
       option('--uri').includes('/namedValues/openai-backend-key?')) {
     console.error('Deploy the Bicep-managed backend key first.');
@@ -96,8 +100,8 @@ if (call.tool === 'curl') {
     if (scenario.tokenFailure) process.exit(17);
     console.log(scenario.emptyToken ? '' : ${JSON.stringify(fakeToken)});
   }
-  if (option('--uri').includes('/namedValues/pii-filter-key/listValue?')) {
-    console.log(scenario.emptyFilterKey ? '' : ${JSON.stringify(fakeFilterKey)});
+  if (option('--uri').includes('/namedValues/pii-filter-key?')) {
+    console.log(scenario.piiSecretUri ?? ${JSON.stringify(secretUri)});
   }
 } else if (args[0] === 'containerapp') {
   if (args[1] === 'create' || args[1] === 'update') {
@@ -140,10 +144,9 @@ if (call.tool === 'curl') {
   assert.ok(!result.stdout.includes(fakeToken));
   assert.ok(!result.stderr.includes(fakeToken));
   assert.ok(!calls.some(call => call.args.some(arg => arg.includes(fakeToken))));
-  assert.ok(!result.stdout.includes(fakeFilterKey));
-  assert.ok(!result.stderr.includes(fakeFilterKey));
-  assert.ok(!calls.some(call => call.args.some(arg => arg.includes(fakeFilterKey))));
-  assert.deepEqual(fs.readdirSync(copy).sort(), ['2_create_self_hosted_gateway.sh', 'common.sh']);
+  assert.ok(!calls.some(call => call.args.some(arg => arg.includes('/listValue'))));
+  assert.deepEqual(fs.readdirSync(copy).sort(),
+    ['2_create_self_hosted_gateway.sh', 'common.sh', 'container-app.template.json']);
   return {...result, calls};
 }
 
@@ -167,14 +170,15 @@ test('creates a secret-backed ACA gateway using Bicep-managed backend credential
   'gateway provisioning must not overwrite the Bicep-managed API or policy');
   assert.ok(azureCalls.some(call => call.args.some(arg => arg.includes('/apis/self-hosted-openai?')) &&
     call.args.some(arg => arg.includes('/gateways/'))));
-  const app = azureCalls.find(call => call['--body']?.type === 'Microsoft.App/containerApps');
-  assert.equal(app.args[0], 'rest');
-  assert.equal(app.args[app.args.indexOf('--method') + 1], 'PUT');
-  assert.equal(app.args[app.args.indexOf('--uri') + 1],
-    'https://management.azure.com/subscriptions/test-sub/resourceGroups/actual-rg/providers/Microsoft.App/containerApps/shg-test-apim?api-version=2024-03-01');
+  const deployment = azureCalls.find(call => call.parameters?.app);
+  assert.deepEqual(deployment.args.slice(0, 5),
+    ['deployment', 'group', 'create', '--resource-group', 'actual-rg']);
+  assert.equal(path.basename(deployment.args[deployment.args.indexOf('--template-file') + 1]),
+    'container-app.template.json');
   assert.ok(!azureCalls.some(call => call.args.includes('--yaml')));
-  assert.equal(app.mode, 0o600);
-  const properties = app['--body'].properties;
+  assert.equal(deployment.mode, 0o600);
+  const app = deployment.parameters.app.value;
+  const properties = app.properties;
   assert.equal(properties.workloadProfileName, 'Consumption');
   const environment = azureCalls.find(call =>
     call.args.slice(0, 3).join(' ') === 'containerapp env create');
@@ -194,14 +198,20 @@ test('creates a secret-backed ACA gateway using Bicep-managed backend credential
     {server: 'testacr.azurecr.io', identity: pullIdentity}
   ]);
   assert.equal(properties.configuration.ingress.targetPort, 8080);
-  assert.equal(properties.configuration.secrets.find(secret =>
-    secret.name === 'pii-filter-key').value, fakeFilterKey);
+  assert.ok(!properties.configuration.secrets.some(secret => secret.name === 'pii-filter-key'));
+  assert.deepEqual(deployment.parameters.piiFilterKey, {reference: {
+    keyVault: {id: '/subscriptions/test-sub/resourceGroups/actual-rg/providers/Microsoft.KeyVault/vaults/kv-test'},
+    secretName: 'pii-filter-key',
+    secretVersion
+  }});
+  assert.deepEqual(filter.env.find(variable => variable.name === 'PII_FILTER_KEY'),
+    {name: 'PII_FILTER_KEY', secretRef: 'pii-filter-key'});
   assert.deepEqual(JSON.parse(properties.configuration.secrets.find(secret =>
     secret.name === 'pii-rules').value),
   JSON.parse(fs.readFileSync(path.join(scripts, '..', 'pii-filter', 'rules.json'), 'utf8')));
   assert.ok(!filter.env.some(variable => Object.hasOwn(variable, 'value')),
     'key and rules must be injected through secretRef');
-  assert.deepEqual(app['--body'].identity,
+  assert.deepEqual(app.identity,
     {type: 'UserAssigned', userAssignedIdentities: {[pullIdentity]: {}}});
   const auth = properties.template.containers[0].env.find(item => item.name === 'config.service.auth');
   assert.deepEqual(auth, {name: 'config.service.auth', secretRef: 'gateway-token'});
@@ -223,10 +233,9 @@ test('reuses the environment and updates and restarts the existing app', t => {
   });
   assert.equal(result.status, 0, result.stderr);
   assert.ok(!result.calls.some(call => call.args.slice(0, 3).join(' ') === 'containerapp env create'));
-  const deployment = result.calls.find(call => call['--body']?.type === 'Microsoft.App/containerApps');
-  assert.equal(deployment.args[deployment.args.indexOf('--method') + 1], 'PUT');
-  assert.equal(deployment['--body'].properties.workloadProfileName, 'Consumption');
-  assert.deepEqual(deployment['--body'].identity,
+  const app = result.calls.find(call => call.parameters?.app).parameters.app.value;
+  assert.equal(app.properties.workloadProfileName, 'Consumption');
+  assert.deepEqual(app.identity,
     {type: 'UserAssigned', userAssignedIdentities: {[pullIdentity]: {}}});
   assert.ok(result.calls.some(call => call.args.slice(0, 3).join(' ') === 'containerapp revision restart'));
 });
@@ -237,7 +246,7 @@ test('preserves legacy Consumption-only environments without naming a workload p
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /Using existing Consumption-only environment/);
     assert.ok(!Object.hasOwn(result.calls.find(call =>
-      call['--body']?.type === 'Microsoft.App/containerApps')['--body'].properties,
+      call.parameters?.app).parameters.app.value.properties,
       'workloadProfileName'));
   }
 });
@@ -250,7 +259,7 @@ test('rejects environments without a matching Consumption profile before deployi
     const result = run(t, {existing: true, workloadProfiles});
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /Environment has no Consumption workload profile/);
-    assert.ok(!result.calls.some(call => call['--body']?.type === 'Microsoft.App/containerApps'));
+    assert.ok(!result.calls.some(call => call.parameters?.app));
     assert.ok(!result.stdout.includes('Gateway is healthy'));
   }
 });
@@ -269,7 +278,7 @@ test('token errors stop deployment and remove temporary credential files', t => 
   for (const scenario of [{emptyToken: true}, {tokenFailure: true}]) {
     const result = run(t, scenario);
     assert.notEqual(result.status, 0);
-    assert.ok(!result.calls.some(call => call['--body']?.type === 'Microsoft.App/containerApps'));
+    assert.ok(!result.calls.some(call => call.parameters?.app));
     assert.ok(!result.stdout.includes('Gateway is healthy'));
   }
 });
@@ -296,12 +305,22 @@ test('waits for the initial gateway API configuration to synchronize', t => {
   assert.equal(result.calls.filter(call => call.tool === 'sleep').length, 1);
 });
 
-test('invalid image, rules or filter key prevent gateway writes', t => {
-  for (const scenario of [{badImage: true}, {invalidRules: true}, {emptyFilterKey: true}]) {
+test('invalid image or rules prevent gateway writes', t => {
+  for (const scenario of [{badImage: true}, {invalidRules: true}]) {
     const result = run(t, scenario);
     assert.notEqual(result.status, 0);
     assert.ok(!result.calls.some(call => call.args.includes('PUT')));
-    assert.ok(!result.calls.some(call => call['--body']?.type === 'Microsoft.App/containerApps'));
+    assert.ok(!result.calls.some(call => call.parameters?.app));
+  }
+});
+
+test('missing, versionless, or unexpected Vault references prevent gateway writes', t => {
+  for (const piiSecretUri of ['', secretUri.replace(`/${secretVersion}`, ''),
+    secretUri.replace('pii-filter-key', 'other-secret')]) {
+    const result = run(t, {piiSecretUri});
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /APIM must reference a specific Key Vault version/);
+    assert.ok(!result.calls.some(call => call.args.includes('PUT') || call.parameters?.app));
   }
 });
 

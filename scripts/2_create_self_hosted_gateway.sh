@@ -14,8 +14,7 @@ WORK_DIR=""
 cleanup() {
   if [[ -n "${WORK_DIR}" ]]; then
     rm -f "${WORK_DIR}/gateway.json" \
-      "${WORK_DIR}/token-request.json" "${WORK_DIR}/app.json" \
-      "${WORK_DIR}/filter-key.txt"
+      "${WORK_DIR}/token-request.json" "${WORK_DIR}/app.parameters.json"
     rmdir "${WORK_DIR}"
   fi
 }
@@ -39,9 +38,9 @@ main() {
   fi
 
   local apim_id resource_group location sku gateway_name app_name
-  local environment_name environment_id gateway_image gateway_uri api_uri
+  local environment_name environment_id gateway_image gateway_uri api_uri pii_secret_uri
   local environment_workload_profiles
-  local login_server rules_file latest_revision ready_revision app_uri provisioning_state
+  local login_server rules_file latest_revision ready_revision provisioning_state
   local environment_count app_count fqdn health_ready attempt response_code
   apim_id="$(azure apim list \
     --query "[?name=='${APIM_NAME}'].id | [0]" --output tsv)"
@@ -133,16 +132,15 @@ NODE
   azure rest --method GET \
     --uri "https://management.azure.com${apim_id}/namedValues/openai-backend-key?api-version=2024-05-01" \
     --output none
-  azure rest --method POST \
-    --uri "https://management.azure.com${apim_id}/namedValues/pii-filter-key/listValue?api-version=2024-05-01" \
-    --query value --output tsv > "${WORK_DIR}/filter-key.txt"
-  node - "${WORK_DIR}/filter-key.txt" <<'NODE'
-const key = require('node:fs').readFileSync(process.argv[2], 'utf8').trim();
-if (!/^[\x21-\x7e]{32,}$/.test(key)) {
-  console.error('APIM did not return a valid PII filter key. Run 0_azd_up.sh first.');
-  process.exit(1);
-}
-NODE
+  pii_secret_uri="$(azure rest --method GET \
+    --uri "https://management.azure.com${apim_id}/namedValues/pii-filter-key?api-version=2024-05-01" \
+    --query properties.keyVault.secretIdentifier --output tsv)"
+  if [[ ! "${pii_secret_uri}" =~ ^https://([a-z][a-z0-9-]{1,22}[a-z0-9])\.vault\.azure\.net/secrets/pii-filter-key/([0-9a-fA-F]{32})$ ]]; then
+    echo "APIM must reference a specific Key Vault version of pii-filter-key. Run 0_azd_up.sh first." >&2
+    exit 1
+  fi
+  local vault_id="${apim_id%%/providers/*}/providers/Microsoft.KeyVault/vaults/${BASH_REMATCH[1]}"
+  local pii_secret_version="${BASH_REMATCH[2]}"
   echo "Registering gateway on ${APIM_NAME}..."
   azure rest --method PUT --uri "${gateway_uri}?api-version=2024-05-01" \
     --body "@${WORK_DIR}/gateway.json" --output none
@@ -177,7 +175,7 @@ NODE
     node -e '
 const fs = require("node:fs");
 const [file, name, location, environmentId, image, apimName, profilesJson,
-  piiImage, registryServer, pullIdentity, rulesFile] = process.argv.slice(1);
+  piiImage, registryServer, pullIdentity, rulesFile, vaultId, secretVersion] = process.argv.slice(1);
 const profiles = JSON.parse(profilesJson);
 if (profiles !== null && !Array.isArray(profiles)) {
   console.error("Container Apps environment returned invalid workload profiles.");
@@ -196,11 +194,9 @@ if (!token || token === "null") {
 }
 const expiry = JSON.parse(fs.readFileSync(
   require("node:path").join(require("node:path").dirname(file), "token-request.json"), "utf8")).expiry;
-const filterKey = fs.readFileSync(
-  require("node:path").join(require("node:path").dirname(file), "filter-key.txt"), "utf8").trim();
 const rulesJson = fs.readFileSync(rulesFile, "utf8");
 const manifest = {
-  name, type: "Microsoft.App/containerApps", location,
+  name, location,
   identity: {type: "UserAssigned", userAssignedIdentities: {[pullIdentity]: {}}},
   properties: {
     managedEnvironmentId: environmentId,
@@ -208,7 +204,6 @@ const manifest = {
       activeRevisionsMode: "Single",
       secrets: [
         {name: "gateway-token", value: `GatewayKey ${token}`},
-        {name: "pii-filter-key", value: filterKey},
         {name: "pii-rules", value: rulesJson}
       ],
       registries: [{server: registryServer, identity: pullIdentity}],
@@ -253,19 +248,29 @@ if (consumptionOnly) {
 } else {
   manifest.properties.workloadProfileName = "Consumption";
 }
-fs.writeFileSync(file, JSON.stringify(manifest), {mode: 0o600});
-' "${WORK_DIR}/app.json" "${app_name}" "${location}" \
+fs.writeFileSync(file, JSON.stringify({
+  $schema: "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  contentVersion: "1.0.0.0",
+  parameters: {
+    app: {value: manifest},
+    piiFilterKey: {reference: {
+      keyVault: {id: vaultId},
+      secretName: "pii-filter-key",
+      secretVersion
+    }}
+  }
+}), {mode: 0o600});
+' "${WORK_DIR}/app.parameters.json" "${app_name}" "${location}" \
       "${environment_id}" "${gateway_image}" "${APIM_NAME}" \
       "${environment_workload_profiles}" "${PII_FILTER_IMAGE}" "${login_server}" \
-      "${ACR_PULL_IDENTITY_ID}" "${rules_file}"
+      "${ACR_PULL_IDENTITY_ID}" "${rules_file}" "${vault_id}" "${pii_secret_version}"
 
   app_count="$(azure containerapp list --resource-group "${resource_group}" \
     --query "length([?name=='${app_name}'])" --output tsv)"
   echo "Deploying ${gateway_image} to ${app_name}..."
-  app_uri="https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${resource_group}/providers/Microsoft.App/containerApps/${app_name}?api-version=2024-03-01"
-  # The Container Apps YAML update path removes empty user-assigned identity objects.
-  azure rest --method PUT --uri "${app_uri}" \
-    --headers Content-Type=application/json --body "@${WORK_DIR}/app.json" --output none
+  azure deployment group create --resource-group "${resource_group}" \
+    --name "${app_name}-gateway" --template-file "${SCRIPT_DIR}/container-app.template.json" \
+    --parameters "@${WORK_DIR}/app.parameters.json" --output none
   echo "Waiting for Container App provisioning..."
   provisioning_state=""
   for ((attempt = 1; attempt <= 60; attempt++)); do

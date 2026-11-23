@@ -41,6 +41,12 @@ Copilot CLI는 GitHub 로그인 없이 BYOK(Bring Your Own Key) offline 모드�
 
 ## 아키텍처
 
+APIM 보안 공지 `MZK9-GH0`의 확인 상태와 구독별 읽기 전용 점검은
+[APIM 보안 공지 점검 가이드](docs/apim-advisory.md)를 참고하세요.
+현재 구독은 `bash scripts/check_apim_advisory.sh`, 전체 접근 가능 구독은
+`bash scripts/check_apim_advisory.sh --all`로 점검합니다.
+조회 완료나 영향 목록에 없는 결과가 안전을 보장하지는 않습니다.
+
 ### ACA 2개 컨테이너 구성
 
 ```mermaid
@@ -163,7 +169,7 @@ CLI의 직접 외부 호출·MCP 통신과 Gateway를 우회한 모델 호출도
 필터 HTTP 서버의 동시 연결 한도는 32이며, 과부하의 `503`도 모델 호출 없이 차단합니다.
 
 필터 호출 키는 백엔드 키·구독 키·Gateway 구성 토큰과 별도로 관리합니다.
-ACA secret과 APIM 비밀 named value에 같은 필터 키를 저장하며,
+ACA secret과 APIM의 Key Vault named value는 같은 버전의 필터 키를 사용하며,
 원문·키를 소스·로그·명령 인수에 노출하지 않고 회전 시 양쪽 설정의 전환을 검증합니다.
 
 Gateway는 `PiiInspection` 이벤트로 구독 ID·요청 ID·탐지 유형·건수·HTTP 판정·검사 시간·규칙 버전을 기록합니다.
@@ -278,12 +284,13 @@ AZURE_ENV_NAME=dev PII_RULES_FILE=/absolute/path/to/approved-rules.json \
 |---|---|
 | 리소스 배포·조회 및 구독 키 조회 | Azure CLI의 `az login`, Azure Developer CLI의 `azd auth login` 세션과 Azure 관리 권한 |
 | Copilot CLI → Self-hosted Gateway | `Ocp-Apim-Subscription-Key` 헤더의 APIM 구독 키 |
-| Self-hosted Gateway → Azure OpenAI | APIM의 비밀 named value `openai-backend-key`에 저장한 Azure OpenAI API 키를 `api-key` 헤더로 전달 |
+| Self-hosted Gateway → Azure OpenAI | APIM의 Key Vault named value `openai-backend-key`에서 해석한 Azure OpenAI API 키를 `api-key` 헤더로 전달 |
 | Gateway → APIM 구성 서비스 | ACA의 `gateway-token` secret에 보관한 별도의 Gateway 연결 토큰으로 구성·정책 동기화 |
 
 Gateway → PII 필터 호출에는 `X-PII-Filter-Key` 헤더를 사용합니다.
-필터 전용 키는 Bicep이 APIM 비밀 named value `pii-filter-key`로 생성하고,
-Gateway 배포 스크립트가 조회해 ACA secret에 저장합니다.
+APIM은 `pii-filter-key`에 지정된 Key Vault 버전을 사용합니다.
+Gateway 배포 스크립트는 값이 아닌 버전만 읽고, Azure Resource Manager(ARM)가
+동일 버전의 값을 배포 시 ACA secret에 주입합니다.
 사용자의 APIM 구독 키나 Azure OpenAI 백엔드 키를 필터 인증에 재사용하지 않습니다.
 
 Gateway는 API의 `subscriptionRequired: true` 설정에 따라 APIM 기본 구독 키 검증을 수행합니다.
@@ -303,7 +310,8 @@ Azure 리소스 관리 로그인은 모델 API 호출 인증과 별개입니다.
 - Bicep 배포 주체의 Azure OpenAI `accounts/listKeys/action` 권한
 - ACR·user-assigned identity 생성과 ACR 범위의 `AcrPull` 역할 할당 권한
 - 이미지 빌드 주체의 ACR Build·repository 메타데이터 조회 권한 및 ACA 배포 주체의 identity 할당 권한
-- Gateway 배포 주체의 APIM `namedValues/listValue/action` 권한
+- 인프라 배포 주체의 Key Vault·secret 관리 권한과 Vault 범위의 `Key Vault Secrets User` 역할 할당 권한
+- Gateway 배포 주체의 APIM `namedValues/read`, ARM 배포 권한 및 대상 Vault의 `Microsoft.KeyVault/vaults/deploy/action` 권한
 - Workbook 조회를 위한 대상 Log Analytics 로그 데이터 조회 권한
 
 CLI 실행 계정에도 위의 리소스 조회·구독 키 읽기 권한이 필요합니다.
@@ -373,6 +381,11 @@ Gateway 컨테이너는 ACA에서 실행하므로 로컬 Docker CLI는 필요하
 
 현재 `feature/pii-filter` 브랜치의 공개 엔드포인트 기반 ACA 배포를 기준으로 합니다.
 Source는 연결을 시작하는 주체이며, Port는 Target의 목적지 포트입니다.
+각 행은 `Source의 Outbound → Target의 Inbound`를 의미합니다.
+예를 들어 사용자 PC에서 Gateway로 보내는 요청은 사용자 PC 기준 Outbound, Gateway 기준 Inbound입니다.
+Gateway에서 APIM·Azure OpenAI로 보내는 요청은 Gateway 기준 Outbound, 각 서비스 기준 Inbound입니다.
+공개·사설 경로 모두 같은 기준을 사용하며, 실제 규칙은 해당 구간의 방화벽·NSG·서비스 네트워크 제어에 적용하세요.
+Target의 Inbound 표시는 연결을 받는 방향을 뜻하며, 관리형 서비스마다 별도의 NSG 규칙을 생성하라는 의미는 아닙니다.
 `<...>`는 실제 배포값으로 바꾸세요. 아래 목록은 방화벽을 자동으로 구성하지 않습니다.
 
 모델 요청 경로는 `사용자 → Self-hosted Gateway → PII 검사 → Gateway → Azure OpenAI`입니다.
@@ -381,7 +394,7 @@ main과 비교하면 같은 ACA replica 내 PII 검사 통신과 PII 이미지 �
 
 #### 모델 호출 및 Gateway 운영
 
-| Source                         | Target                                                            | Port       | 용도 및 적용 조건                                           |
+| Source (Outbound)              | Target (Inbound)                                                  | Port       | 용도 및 적용 조건                                           |
 |--------------------------------|-------------------------------------------------------------------|------------|------------------------------------------------------------|
 | 사용자 PC / Copilot CLI         | ACA Gateway FQDN `<app>.<환경 도메인>.azurecontainerapps.io`        | TCP 443    | 모델 요청, Gateway 상태 확인                                |
 | Self-hosted Gateway            | `<APIM명>.configuration.azure-api.net`                             | TCP 443    | API·정책·구독 동기화 및 상태 보고                            |
@@ -394,11 +407,18 @@ main과 비교하면 같은 ACA replica 내 PII 검사 통신과 PII 이미지 �
 PII 필터는 로컬 규칙으로 검사하므로 외부 PII 분석 서비스나 별도 모델 API에 접속하지 않습니다.
 필터는 probe 접근을 위해 `0.0.0.0:8000`으로 수신하지만 외부 ingress에는 연결하지 않습니다.
 외부 방화벽 개방이 불필요하다는 의미이지 loopback에만 바인딩되거나 네트워크 격리가 보장된다는 뜻은 아닙니다.
+같은 replica의 loopback 검사 통신도 송신·수신 방향으로 표기했지만, 외부 네트워크 경계를 통과하는 통신은 아닙니다.
 검사 API의 필터 전용 키 인증을 유지하세요.
+
+Copilot CLI와 ACA는 Key Vault에 직접 연결하지 않으므로 온프레미스 CLI 방화벽이나 ACA 송신 규칙을 추가할 필요가 없습니다.
+Vault 방화벽은 기본 거부이며, APIM 관리 영역은 시스템 할당 관리 ID와
+[신뢰할 수 있는 Microsoft 서비스 예외](https://learn.microsoft.com/en-us/azure/api-management/api-management-howto-properties#requirements-for-key-vault-firewall)를 사용합니다.
+ARM은 배포 시에만 Vault에서 PII 키를 읽습니다. 초기 키를 별도 Vault에서 가져오는 배포 PC나 운영자는
+해당 원본 Vault의 데이터 영역 접근 조건을 별도로 충족해야 합니다.
 
 #### 모니터링 및 조건부 통신
 
-| Source              | Target                                                                                  | Port    | 용도 및 적용 조건                                                        |
+| Source (Outbound)   | Target (Inbound)                                                                        | Port    | 용도 및 적용 조건                                                        |
 |---------------------|-----------------------------------------------------------------------------------------|---------|-------------------------------------------------------------------------|
 | Self-hosted Gateway | Application Insights 연결 문자열의 `IngestionEndpoint` 호스트                            | TCP 443 | 요청·오류·PII 판정 메타데이터·토큰 사용량 전송                             |
 | Self-hosted Gateway | `dc.services.visualstudio.com`, `rt.services.visualstudio.com`                            | TCP 443 | Microsoft가 안내하는 Application Insights 통합 대상, 실제 수집 설정 확인 |
@@ -414,7 +434,7 @@ PII 원문이나 실제 탐지값은 로그로 전송하지 않습니다.
 
 #### 현재 실행 스크립트 및 배포·관리
 
-| Source                       | Target                                                         | Port    | 용도 및 적용 조건                                         |
+| Source (Outbound)            | Target (Inbound)                                               | Port    | 용도 및 적용 조건                                         |
 |------------------------------|----------------------------------------------------------------|---------|----------------------------------------------------------|
 | 사용자 PC / 배포·관리 PC      | `management.azure.com`                                         | TCP 443 | 실행 전 리소스·APIM 구독 키 조회, 리소스 배포·관리          |
 | 사용자 PC / 배포·관리 PC      | `login.microsoftonline.com` 및 테넌트 로그인에 필요한 엔드포인트 | TCP 443 | Azure 로그인·토큰 갱신, 인증 방식별 추가 대상 확인          |
@@ -435,6 +455,7 @@ ACR 이미지 다운로드 대상은 레지스트리 설정에 따라 전용 데
 - 외부 클라이언트는 TCP 443만 사용하며, ACA가 컨테이너 내부 TCP 8080으로 전달하므로 8080과 PII용 8000을 외부에 개방하지 않습니다.
 - Gateway가 설정 동기화를 시작하므로 APIM에서 Gateway로 새 연결을 시작하는 인바운드 규칙은 필요하지 않습니다.
 - 상태 기반 방화벽에서는 허용한 연결의 응답 트래픽을 반환 경로로 처리합니다.
+- 응답을 위해 Target에서 Source로 새 연결을 시작하는 반대 방향 규칙을 추가하지 않습니다. 비상태 기반 ACL은 응답용 임시 포트 범위를 별도 검토해야 합니다.
 - FQDN과 실제 해석되는 IP가 모두 접근 가능해야 합니다. IP 기반 규칙은 주소 변경을 추적해야 합니다.
 - Private Endpoint나 사설 Gateway를 도입하면 대상 주소·라우팅·Private DNS를 해당 구성에 맞게 변경해야 합니다.
 - ACA 플랫폼 자체의 전체 네트워크 의존성, 도구 설치·업데이트, 플러그인·MCP 및 실행 명령의 추가 통신은 별도 검토 대상입니다.
@@ -477,7 +498,7 @@ PII sidecar는 main과 다른 내부 검사 단계일 뿐 사설망 연결을 �
 환경별 실제 사설 IP·서브넷과 정책으로 구체화해야 하며, 플랫폼·관리 통신을 포함한 전체 허용 목록은 아닙니다.
 기존 공개 IP 규칙은 사설 전환 검증 후 필요한 항목만 대체하거나 제거하세요.
 
-| Source                         | Target                                                        | Port       | 전제 조건                                          |
+| Source (Outbound)              | Target (Inbound)                                              | Port       | 전제 조건                                          |
 |--------------------------------|---------------------------------------------------------------|------------|---------------------------------------------------|
 | 기업망 사용자 PC               | Gateway의 사설 진입 IP 또는 내부 프록시 IP                     | TCP 443    | VPN/ExpressRoute 등 사설 경로와 Gateway FQDN 해석   |
 | Self-hosted Gateway            | APIM v2 구성 엔드포인트의 사설 IP                              | TCP 443    | 내부 VNet 구성 및 구성 FQDN의 사설 DNS·라우팅       |
@@ -526,8 +547,17 @@ PII sidecar는 main과 다른 내부 검사 단계일 뿐 사설망 연결을 �
 cp .env.example .env
 # .env 값을 편집합니다. 기존 환경에서는 복사로 덮어쓰지 마세요.
 azd env new dev  # 최초 한 번만 실행합니다.
+azd env set-secret PII_FILTER_KEY -e dev  # 최초 배포 또는 기존 환경 전환 시에만 실행합니다.
 ./scripts/0_azd_up.sh
+azd env unset PII_FILTER_KEY -e dev  # 배포가 성공하면 입력 참조만 제거합니다.
 ```
+
+최초 배포에는 승인된 원본 Key Vault에서 32자 이상의 무작위 URL-safe 필터 키를 지정하세요.
+기존 환경을 전환할 때는 서비스 영향을 줄이기 위해 현재 사이드카와 APIM이 쓰는 **동일한** 필터 키를
+승인된 비밀 관리 경로로 준비해 지정하세요. 기존 키를 사용하지 못하면 점검 시간에 두 배포를 진행하세요.
+대상 Vault에 `pii-filter-key`가 이미 있으면 일반 재배포에서는 `set-secret`과 `unset`을 생략합니다.
+역할 할당 직후 APIM이 Vault 접근 오류를 반환하면 권한 전파를 기다린 뒤 재배포하세요.
+Vault에 필터 키가 이미 생성됐다면 재시도 전에 `azd`의 입력 참조를 제거해 버전을 다시 생성하지 않습니다.
 
 [0_azd_up.sh](scripts/0_azd_up.sh)는 저장소 루트의 `.env`를
 `azd env set --file .env`로 가져온 뒤 `azd up`을 실행합니다.
@@ -538,8 +568,9 @@ azd env new dev  # 최초 한 번만 실행합니다.
 
 - 작업 영역 기반 Application Insights, Log Analytics, 사용량 Workbook 및 APIM 서비스의 GatewayLogs 진단 설정
 - API 키 인증을 활성화한 Azure OpenAI 계정 및 모델 배포
-- APIM 서비스 및 비밀 named value `openai-backend-key`(Azure OpenAI primary key 저장)
-- PII 필터 전용 비밀 named value `pii-filter-key`
+- APIM 서비스, 전용 Key Vault 및 APIM 시스템 할당 관리 ID의 `Key Vault Secrets User` 역할
+- `openai-backend-key`: Key Vault의 Azure OpenAI KEY 1을 버전 없이 참조
+- `pii-filter-key`: APIM과 ACA가 함께 사용할 Key Vault secret 버전을 고정해 참조
 - Basic ACR(admin 계정 비활성화), 이미지 pull용 user-assigned identity와 ACR 범위의 `AcrPull` 역할
 - 구독 필수 `self-hosted-openai` API와 `POST /self-hosted/openai/chat/completions` 통합 정책
 - 구독 필수 Product `copilot-cli`(API를 묶는 단위)와 API 연결
@@ -595,7 +626,7 @@ azd 환경 없이 실행한다면 출력된 실제 `PII_FILTER_IMAGE`를 환경�
 리소스 그룹과 지역을 조회하고 다음을 구성합니다.
 `Microsoft.App` 리소스 공급자와 필요한 관리 권한은 미리 준비하세요.
 
-- Bicep이 배포한 `self-hosted-openai` API와 백엔드 키 named value 존재 확인
+- Bicep이 배포한 `self-hosted-openai` API, 백엔드 키 named value, 버전이 지정된 PII 키 참조 확인
 - Self-hosted gateway 등록과 기존 API의 gateway 연결
 - ACA 환경과 HTTPS 외부 ingress의 Container App
 - 신규 환경과 앱의 `Consumption` profile 구성
@@ -610,8 +641,9 @@ API·operation·Product 연결·정책·진단은 Bicep에서 관리합니다.
 `ACR_NAME`, `ACR_PULL_IDENTITY_ID`, digest 기반 `PII_FILTER_IMAGE`가 필요합니다.
 기본 규칙은 [rules.json](pii-filter/rules.json)이며 `PII_RULES_FILE`로 다른 승인 파일을 지정할 수 있습니다.
 
-앱 생성·업데이트는 생성한 JSON을 ARM REST `PUT`으로 직접 전달합니다.
+앱 생성·업데이트는 [ARM 템플릿](scripts/container-app.template.json)으로 배포합니다.
 일부 Azure CLI `containerapp` 확장의 YAML 업데이트가 빈 사용자 할당 ID 객체를 제거하는 문제를 피하기 위한 방식입니다.
+PII 키 값은 배포 PC, 로컬 임시 파일 또는 배포 명령 인수를 거치지 않습니다.
 스크립트는 provisioning 완료(최대 약 10분)를 기다린 뒤 새 revision의 readiness,
 Gateway 상태와 구독 키 없는 요청의 거절 여부를 확인합니다. 배포 실패·취소·시간 초과는 오류로 종료합니다.
 모델 호출 검증은 4단계에서 하며 PII 차단·장애 검증은 별도로 수행해야 합니다.
@@ -717,9 +749,9 @@ CLI가 HTTP `403`을 인증 실패로만 표시하는 경우를 보완하기 위
 CLI 자체의 인증 오류 문구는 추가로 보일 수 있습니다.
 `--verify-only`도 같은 안전한 오류 안내를 표시하지만 로컬 릴레이를 실행하지 않습니다.
 
-이 변경을 기존 환경에 적용하려면 APIM 정책을 포함한 0단계를 다시 실행한 뒤 2단계로
-필터 키를 동기화하고 4단계를 실행하세요. 0단계에서 필터 키가 회전하므로 2단계를 생략하면
-검사 인증 실패로 `503`이 발생할 수 있습니다. PII 컨테이너 코드는 바뀌지 않아 1단계 이미지 재빌드는 필요 없습니다.
+기존 환경을 Key Vault로 전환하려면 [0단계](#0-설정과-apim모델-배포)에 따라 현재 필터 키를
+준비하세요. APIM 정책을 배포한 뒤 2단계로 동일한 Key Vault 버전을 ACA에 반영하고
+4단계로 검증합니다. 컨테이너 코드가 바뀌지 않았다면 1단계 이미지 재빌드는 필요 없습니다.
 
 ```bash
 ./scripts/0_azd_up.sh
@@ -825,19 +857,19 @@ VM이나 기존 컨테이너를 단순 재시작하는 것만으로 토큰이 �
 
 #### PII 필터 키 교체
 
-Bicep의 `piiFilterKey` 기본값은 매 인프라 배포 시 새 UUID로 생성됩니다.
-따라서 `0_azd_up.sh`를 실행하면 APIM의 필터 키가 교체되며, 기존 sidecar는 새 키를 받을 때까지
-인증 실패로 모델 요청을 차단할 수 있습니다. 인프라 재배포 후에는 다음을 실행하세요.
+일반 인프라 재배포는 필터 키의 새 버전을 만들지 않습니다.
+교체할 때는 작업 시간을 확보하고, 최초 배포와 같은 `azd env set-secret` 방식으로 새 키를 공급한 뒤
+`0_azd_up.sh`를 실행합니다. Vault 버전이 바뀌면 기존 sidecar와 APIM의 키가 달라져
+모델 요청이 차단될 수 있으므로 바로 아래 명령을 실행하세요.
 
 ```bash
 ./scripts/2_create_self_hosted_gateway.sh
 ```
 
-이 스크립트는 APIM의 최신 필터 키를 권한 제한 임시 파일로 조회하고 ACA secret에 반영합니다.
-이미지나 규칙을 바꾸지 않아도 실행할 수 있으며, Gateway 구성 토큰도 함께 갱신합니다.
-무중단 이중 키 전환과 자동 회전은 현재 지원하지 않습니다.
-별도 키를 유지하려면 Bicep의 secure `piiFilterKey` 매개변수를 승인된 비밀 주입 경로로 공급하세요.
-키를 `.env`·소스·명령 인수에 넣지는 마세요.
+이 스크립트는 APIM이 지정한 버전을 ACA 배포에 전달하고 Gateway 구성 토큰도 함께 갱신합니다.
+`azd env unset PII_FILTER_KEY`로 일회성 입력 참조를 제거하고, Gateway 설정 동기화 후 정상 모델 호출과
+PII 차단을 확인하세요. Vault에 직접 새 버전을 추가하는 것만으로 APIM과 ACA가 자동으로 전환되지는 않습니다.
+키를 `.env`·소스·명령 인수에 넣지 마세요. 무중단 이중 키 전환은 지원하지 않습니다.
 
 #### APIM 구독 키 교체
 
@@ -855,14 +887,15 @@ Secondary key를 이용한 무중단 전환은 현재 CLI 스크립트에서 지
 
 #### Azure OpenAI 백엔드 키 교체
 
-현재 Bicep은 Azure OpenAI의 KEY 1을 APIM의 비밀 named value `openai-backend-key`에 저장합니다.
+현재 Bicep은 Azure OpenAI의 KEY 1을 Key Vault에 저장하고, APIM의 `openai-backend-key`는 이 secret을 참조합니다.
 자동으로 KEY 2로 전환하는 기능은 없으므로, 현재 스크립트 기준으로는 작업 시간을 확보하고 교체합니다.
 
 1. 해당 KEY 1의 모든 사용처와 영향을 확인하고 모델 요청을 중단합니다.
 2. Azure Portal에서 Azure OpenAI 리소스의 KEY 1을 재생성합니다. 이전 KEY 1은 사용할 수 없게 됩니다.
-3. `./scripts/0_azd_up.sh`를 실행합니다. Bicep이 새 KEY 1을 조회해 named value에 반영합니다.
+3. `./scripts/0_azd_up.sh`를 실행합니다. Bicep이 새 KEY 1을 Key Vault에 저장합니다.
    이 명령은 전체 Bicep 인프라를 재배포하므로 다른 구성에 미치는 영향도 확인하세요.
-4. Gateway 설정 동기화와 아래 공통 검증을 완료한 뒤 모델 요청을 재개합니다.
+4. APIM에서 `openai-backend-key`의 Key Vault 참조를 새로 고침하거나 자동 갱신(최대 4시간)을 기다립니다.
+   Gateway 설정 동기화와 아래 공통 검증을 완료한 뒤 모델 요청을 재개합니다.
 
 ![Azure OpenAI의 API 키 인증 설정과 KEY 1 재생성 메뉴](images/6.png)
 
